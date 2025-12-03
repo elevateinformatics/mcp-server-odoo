@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/mcp-server-odoo/
+      url: https://pypi.org/project/mcp-server-odoo-ei/
     permissions:
       id-token: write  # Required for trusted publishing
     
