@@ -1,7 +1,7 @@
 """MCP Server for Odoo - Model Context Protocol server for Odoo ERP systems."""
 
-__version__ = "0.1.0"
-__author__ = "Andrey Ivanov"
+__version__ = "0.3.1"
+__author__ = "Luciano Bustos"
 __license__ = "MPL-2.0"
 
 from .access_control import AccessControlError, AccessController, ModelPermissions

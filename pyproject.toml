@@ -9,11 +9,11 @@ description = "A Model Context Protocol server for Odoo ERP systems"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "Andrey Ivanov", email = "ivnv.xd@gmail.com" },
+    { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" },
     { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" }
 ]
 maintainers = [
-    { name = "Andrey Ivanov", email = "ivnv.xd@gmail.com" },
+    { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" },
     { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" }
 ]
 license = { text = "MPL-2.0" }

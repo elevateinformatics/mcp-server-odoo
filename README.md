@@ -25,6 +25,8 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🎯 **Smart pagination** for large datasets
 - 💬 **LLM-optimized output** with hierarchical text formatting
 - 🚀 **YOLO Mode** for quick access with any Odoo instance (no module required)
+- 🌐 **Locale Support**: with the variable ODOO_LOCALE you can set the language (es_AR).
+
 
 ## Installation
 
