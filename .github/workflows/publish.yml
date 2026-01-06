@@ -9,9 +9,7 @@ jobs:
   publish:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/mcp-server-odoo-ei/
+    # Note: No environment specified to match PyPI trusted publisher config (Any)
     permissions:
       id-token: write  # Required for trusted publishing
     

@@ -989,7 +989,9 @@ class OdooToolHandler:
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
-                essential_fields = ["id", "name", "display_name"]
+                # Note: Only use 'id' and 'display_name' as they always exist
+                # 'name' field doesn't exist in all models (e.g., survey.survey uses 'title')
+                essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
                 records = self.connection.read(model, [record_id], essential_fields)
@@ -1052,7 +1054,9 @@ class OdooToolHandler:
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
-                essential_fields = ["id", "name", "display_name"]
+                # Note: Only use 'id' and 'display_name' as they always exist
+                # 'name' field doesn't exist in all models (e.g., survey.survey uses 'title')
+                essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
                 records = self.connection.read(model, [record_id], essential_fields)

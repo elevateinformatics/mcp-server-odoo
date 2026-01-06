@@ -54,9 +54,10 @@ class TestWriteTools:
         model = "res.partner"
         values = {"name": "Test Partner", "email": "test@example.com"}
         created_id = 123
+        # Note: essential_fields now only includes 'id' and 'display_name'
+        # to support models without 'name' field (e.g., survey.survey)
         essential_record = {
             "id": created_id,
-            "name": "Test Partner",
             "display_name": "Test Partner",
         }
 
@@ -76,7 +77,7 @@ class TestWriteTools:
         assert "Successfully created" in result["message"]
         mock_connection.create.assert_called_once_with(model, values)
         mock_connection.read.assert_called_once_with(
-            model, [created_id], ["id", "name", "display_name"]
+            model, [created_id], ["id", "display_name"]
         )
 
     @pytest.mark.asyncio
@@ -105,7 +106,9 @@ class TestWriteTools:
         # First read call (existence check) returns just ID
         existing_record = {"id": record_id}
         # Second read call returns essential fields
-        updated_record = {"id": record_id, "name": "Test Partner", "display_name": "Test Partner"}
+        # Note: essential_fields now only includes 'id' and 'display_name'
+        # to support models without 'name' field (e.g., survey.survey)
+        updated_record = {"id": record_id, "display_name": "Test Partner"}
 
         mock_connection.read.side_effect = [[existing_record], [updated_record]]
         mock_connection.write.return_value = True
@@ -125,7 +128,7 @@ class TestWriteTools:
         # Verify both read calls with correct parameters
         expected_calls = [
             call(model, [record_id], ["id"]),  # Existence check
-            call(model, [record_id], ["id", "name", "display_name"]),  # Essential fields
+            call(model, [record_id], ["id", "display_name"]),  # Essential fields
         ]
         mock_connection.read.assert_has_calls(expected_calls)
 
