@@ -51,7 +51,7 @@ Optional environment variables:
   ODOO_MCP_HOST          Server host for HTTP transports (default: localhost)
   ODOO_MCP_PORT          Server port for HTTP transports (default: 8000)
 
-For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
+For more information, visit: https://github.com/elevateinformatics/mcp-server-odoo""",
     )
 
     parser.add_argument(

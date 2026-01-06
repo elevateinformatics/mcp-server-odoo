@@ -40,6 +40,10 @@ class OdooConfig:
     # YOLO mode configuration
     yolo_mode: str = "off"  # "off", "read", or "true"
 
+    # Cache TTL configuration (in seconds)
+    cache_field_ttl: int = 3600  # 1 hour for field metadata (on-demand only)
+    cache_permission_ttl: int = 300  # 5 minutes for permissions
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         # Validate URL
@@ -226,6 +230,8 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         host=os.getenv("ODOO_MCP_HOST", "localhost").strip(),
         port=get_int_env("ODOO_MCP_PORT", 8000),
         yolo_mode=get_yolo_mode(),
+        cache_field_ttl=get_int_env("ODOO_CACHE_FIELD_TTL", 3600),
+        cache_permission_ttl=get_int_env("ODOO_CACHE_PERMISSION_TTL", 300),
     )
 
     return config

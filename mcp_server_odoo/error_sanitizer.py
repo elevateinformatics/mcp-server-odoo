@@ -6,7 +6,22 @@ useful information for debugging.
 """
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Pattern, Tuple
+
+# Pre-compiled regex patterns for better performance
+_WHITESPACE_PATTERN: Pattern[str] = re.compile(r"\s+")
+_FULL_FIELD_PATTERN: Pattern[str] = re.compile(
+    r"[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_.]*\.([a-zA-Z_][a-zA-Z0-9_]*)"
+)
+_QUOTED_FIELD_PATTERN: Pattern[str] = re.compile(r"['\"]([a-zA-Z_][a-zA-Z0-9_]*)['\"]")
+_MODEL_PATTERN: Pattern[str] = re.compile(
+    r"model\s+['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)['\"]?", re.IGNORECASE
+)
+_ID_PATTERN: Pattern[str] = re.compile(r"ID\s+(\d+)", re.IGNORECASE)
+_XMLRPC_FIELD_PATTERN: Pattern[str] = re.compile(
+    r"field\s+['\"]?([a-zA-Z_][a-zA-Z0-9_\.]*)['\"]?", re.IGNORECASE
+)
+_USER_ERROR_PATTERN: Pattern[str] = re.compile(r'UserError\(["\']([^"\']+)["\']')
 
 
 class ErrorSanitizer:
@@ -95,7 +110,7 @@ class ErrorSanitizer:
             sanitized = re.sub(pattern, replacement, sanitized, flags=re.MULTILINE)
 
         # Clean up multiple spaces and newlines
-        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        sanitized = _WHITESPACE_PATTERN.sub(" ", sanitized).strip()
 
         # If the message is now too generic or empty, provide a better default
         if not sanitized or sanitized == "file" or len(sanitized) < 10:
@@ -121,26 +136,21 @@ class ErrorSanitizer:
         # Try to extract field names - look for the actual field name after model prefix
         if "field" in pattern.lower():
             # First try to find field after model name (e.g., res.partner.field_name)
-            full_field_match = re.search(
-                r"[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_.]*\.([a-zA-Z_][a-zA-Z0-9_]*)",
-                message,
-            )
+            full_field_match = _FULL_FIELD_PATTERN.search(message)
             if full_field_match:
                 return full_field_match.group(1)
             # Otherwise try to find any quoted field name
-            field_match = re.search(r"['\"]([a-zA-Z_][a-zA-Z0-9_]*)['\"]", message)
+            field_match = _QUOTED_FIELD_PATTERN.search(message)
             if field_match:
                 return field_match.group(1)
 
         # Try to extract model names
-        model_match = re.search(
-            r"model\s+['\"]?([a-zA-Z_][a-zA-Z0-9_.]*)['\"]?", message, re.IGNORECASE
-        )
+        model_match = _MODEL_PATTERN.search(message)
         if model_match and "model" in pattern.lower():
             return model_match.group(1)
 
         # Try to extract record IDs
-        id_match = re.search(r"ID\s+(\d+)", message, re.IGNORECASE)
+        id_match = _ID_PATTERN.search(message)
         if id_match and "record" in pattern.lower():
             return id_match.group(1)
 
@@ -220,9 +230,7 @@ class ErrorSanitizer:
             return "The requested resource does not exist"
         elif "Invalid field" in fault_string:
             # Try to extract field name
-            field_match = re.search(
-                r"field\s+['\"]?([a-zA-Z_][a-zA-Z0-9_\.]*)['\"]?", fault_string, re.IGNORECASE
-            )
+            field_match = _XMLRPC_FIELD_PATTERN.search(fault_string)
             if field_match:
                 return f"Invalid field '{field_match.group(1)}' in request"
             return "Invalid field in request"
@@ -232,7 +240,7 @@ class ErrorSanitizer:
             return "Validation error: Please check your input"
         elif "UserError" in fault_string:
             # Try to extract the user-friendly part of UserError
-            user_msg_match = re.search(r'UserError\(["\']([^"\']+)["\']', fault_string)
+            user_msg_match = _USER_ERROR_PATTERN.search(fault_string)
             if user_msg_match:
                 return user_msg_match.group(1)
             return "Operation failed due to business rule violation"

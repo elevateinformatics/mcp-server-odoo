@@ -207,6 +207,8 @@ class TestConnectionPool:
         """Create mock config."""
         config = Mock(spec=OdooConfig)
         config.url = os.getenv("ODOO_URL", "http://localhost:8069")
+        config.cache_field_ttl = 3600
+        config.cache_permission_ttl = 300
         return config
 
     def test_connection_pool_creation(self, mock_config):
@@ -376,6 +378,8 @@ class TestPerformanceManager:
         """Create mock config."""
         config = Mock(spec=OdooConfig)
         config.url = os.getenv("ODOO_URL", "http://localhost:8069")
+        config.cache_field_ttl = 3600
+        config.cache_permission_ttl = 300
         return config
 
     def test_performance_manager_creation(self, mock_config):
@@ -428,41 +432,30 @@ class TestPerformanceManager:
         cached = manager.get_cached_fields("res.partner")
         assert cached == fields
 
-    def test_record_caching(self, mock_config):
-        """Test record caching."""
+    def test_record_caching_disabled(self, mock_config):
+        """Test that record caching is disabled - always returns None."""
         manager = PerformanceManager(mock_config)
 
         record = {"id": 1, "name": "Test Partner", "email": "test@example.com"}
 
-        # Cache record
+        # Try to cache record (should be no-op)
         manager.cache_record("res.partner", record, fields=["name", "email"])
 
-        # Get cached record
+        # Get cached record - should always return None (caching disabled)
         cached = manager.get_cached_record("res.partner", 1, fields=["name", "email"])
-        assert cached == record
+        assert cached is None
 
-    def test_record_cache_invalidation(self, mock_config):
-        """Test record cache invalidation."""
+    def test_record_cache_invalidation_noop(self, mock_config):
+        """Test record cache invalidation is a no-op when caching is disabled."""
         manager = PerformanceManager(mock_config)
 
-        # Cache some records with same fields parameter as when retrieving
+        # These should not raise errors even though caching is disabled
         manager.cache_record("res.partner", {"id": 1, "name": "Partner 1"}, fields=None)
-        manager.cache_record("res.partner", {"id": 2, "name": "Partner 2"}, fields=None)
-        manager.cache_record("res.users", {"id": 1, "name": "User 1"}, fields=None)
-
-        # Verify they're cached
-        assert manager.get_cached_record("res.partner", 1, fields=None) is not None
-        assert manager.get_cached_record("res.partner", 2, fields=None) is not None
-
-        # Invalidate specific record
         manager.invalidate_record_cache("res.partner", 1)
-        assert manager.get_cached_record("res.partner", 1, fields=None) is None
-        assert manager.get_cached_record("res.partner", 2, fields=None) is not None
-
-        # Invalidate all partner records
         manager.invalidate_record_cache("res.partner")
-        assert manager.get_cached_record("res.partner", 2, fields=None) is None
-        assert manager.get_cached_record("res.users", 1, fields=None) is not None
+
+        # All should return None
+        assert manager.get_cached_record("res.partner", 1, fields=None) is None
 
     def test_permission_caching(self, mock_config):
         """Test permission caching."""
@@ -523,22 +516,24 @@ class TestPerformanceIntegration:
         """Create mock config."""
         config = Mock(spec=OdooConfig)
         config.url = os.getenv("ODOO_URL", "http://localhost:8069")
+        config.cache_field_ttl = 3600
+        config.cache_permission_ttl = 300
         return config
 
     @pytest.mark.asyncio
-    async def test_concurrent_cache_access(self, mock_config):
-        """Test cache with concurrent access."""
+    async def test_concurrent_permission_cache_access(self, mock_config):
+        """Test permission cache with concurrent access."""
         manager = PerformanceManager(mock_config)
 
         async def cache_operation(i):
             """Perform cache operations."""
-            # Write
-            manager.cache_record("res.partner", {"id": i, "name": f"Partner {i}"}, fields=None)
+            # Write permission
+            manager.cache_permission("res.partner", "read", user_id=i, allowed=True)
 
             # Read
             for _ in range(10):
-                record = manager.get_cached_record("res.partner", i, fields=None)
-                assert record is not None
+                permission = manager.get_cached_permission("res.partner", "read", user_id=i)
+                assert permission is True
                 await asyncio.sleep(0.001)
 
         # Run concurrent operations (start from 1 to avoid ID 0)
@@ -546,7 +541,7 @@ class TestPerformanceIntegration:
         await asyncio.gather(*tasks)
 
         # Check stats
-        stats = manager.record_cache.get_stats()
+        stats = manager.permission_cache.get_stats()
         assert stats["hits"] >= 90  # At least 90 hits from 10 tasks * 10 reads
         assert stats["total_entries"] == 10
 
@@ -556,14 +551,14 @@ class TestPerformanceIntegration:
 
         start_time = time.time()
 
-        # Simulate heavy usage
+        # Simulate heavy usage with field and permission caches (not record cache)
         for i in range(1000):
-            # Cache operations
-            manager.cache_record("res.partner", {"id": i, "name": f"Partner {i}"})
+            # Permission cache operations
+            manager.cache_permission("res.partner", "read", user_id=i % 100, allowed=True)
 
             # Some cache hits
             if i > 100:
-                manager.get_cached_record("res.partner", i - 100)
+                manager.get_cached_permission("res.partner", "read", user_id=(i - 100) % 100)
 
             # Track operations
             with manager.monitor.track_operation(f"op_{i % 10}"):
@@ -574,6 +569,6 @@ class TestPerformanceIntegration:
         # Should complete reasonably fast
         assert duration < 5.0  # 5 seconds for 1000 operations
 
-        # Check cache is working
-        stats = manager.record_cache.get_stats()
+        # Check permission cache is working
+        stats = manager.permission_cache.get_stats()
         assert stats["hit_rate"] > 0.8  # Good hit rate

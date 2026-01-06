@@ -410,21 +410,27 @@ class TestLoggingConfiguration:
     def test_setup_logging(self):
         """Test logging setup."""
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            setup_logging(
-                log_level="DEBUG",
-                use_json=True,
-                log_file=tmp.name,
-            )
+            tmp_name = tmp.name
 
-            logger = logging.getLogger("test")
-            logger.debug("Test debug message")
+        setup_logging(
+            log_level="DEBUG",
+            use_json=True,
+            log_file=tmp_name,
+        )
 
-            # Check that file was written
-            assert os.path.exists(tmp.name)
-            assert os.path.getsize(tmp.name) > 0
+        logger = logging.getLogger("test")
+        logger.debug("Test debug message")
 
-            # Clean up
-            os.unlink(tmp.name)
+        # Check that file was written
+        assert os.path.exists(tmp_name)
+        assert os.path.getsize(tmp_name) > 0
+
+        # Clean up - close handlers first to release file lock on Windows
+        for handler in logging.root.handlers[:]:
+            if hasattr(handler, 'baseFilename') and handler.baseFilename == tmp_name:
+                handler.close()
+                logging.root.removeHandler(handler)
+        os.unlink(tmp_name)
 
     def test_logging_config_from_env(self):
         """Test loading logging config from environment."""

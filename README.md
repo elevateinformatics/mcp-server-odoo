@@ -1,6 +1,6 @@
 # MCP Server for Odoo
 
-[![CI](https://github.com/ivnvxd/mcp-server-odoo/actions/workflows/ci.yml/badge.svg)](https://github.com/ivnvxd/mcp-server-odoo/actions/workflows/ci.yml)
+[![CI](https://github.com/elevateinformatics/mcp-server-odoo/actions/workflows/ci.yml/badge.svg)](https://github.com/elevateinformatics/mcp-server-odoo/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/ivnvxd/mcp-server-odoo/branch/main/graph/badge.svg)](https://codecov.io/gh/ivnvxd/mcp-server-odoo)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
@@ -211,7 +211,7 @@ Then use `mcp-server-odoo-ei` as the command in your MCP configuration.
 <summary>From source</summary>
 
 ```bash
-git clone https://github.com/ivnvxd/mcp-server-odoo.git
+git clone https://github.com/elevateinformatics/mcp-server-odoo.git
 cd mcp-server-odoo
 pip install -e .
 ```
@@ -678,6 +678,53 @@ Enable debug logging for more information:
 ```
 </details>
 
+## Performance Optimization
+
+The server includes several performance optimizations:
+
+### Cache Configuration
+
+Field metadata and permissions are cached on-demand. Records always fetch fresh data from Odoo.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ODOO_CACHE_FIELD_TTL` | `3600` | Field metadata cache TTL (seconds) |
+| `ODOO_CACHE_PERMISSION_TTL` | `300` | Permission check cache TTL (seconds) |
+
+Example configuration:
+
+```json
+{
+  "env": {
+    "ODOO_URL": "https://your-odoo.com",
+    "ODOO_API_KEY": "your-key",
+    "ODOO_CACHE_FIELD_TTL": "7200",
+    "ODOO_CACHE_PERMISSION_TTL": "600"
+  }
+}
+```
+
+### Building Optimized Executables
+
+For improved startup time and runtime performance, you can compile the server using Nuitka:
+
+```bash
+# Install build dependencies
+pip install -e ".[build]"
+
+# Build optimized executable
+python scripts/build_nuitka.py
+
+# Or build as standalone directory
+python scripts/build_nuitka.py --standalone
+```
+
+The compiled executable provides:
+- **20-50% faster runtime** compared to interpreted Python
+- **Faster startup time** with optimized imports
+- **Single file distribution** (with `--onefile`)
+- **No Python runtime required** on target machines
+
 ## Development
 
 <details>
@@ -685,7 +732,7 @@ Enable debug logging for more information:
 
 ```bash
 # Clone the repository
-git clone https://github.com/ivnvxd/mcp-server-odoo.git
+git clone https://github.com/elevateinformatics/mcp-server-odoo.git
 cd mcp-server-odoo
 
 # Install in development mode

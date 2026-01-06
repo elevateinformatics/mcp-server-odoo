@@ -29,6 +29,8 @@ class TestOdooConnectionCaching:
         config.uses_api_key = False
         config.uses_credentials = True
         config.is_yolo_enabled = False
+        config.cache_field_ttl = 3600
+        config.cache_permission_ttl = 300
         config.yolo_mode = "off"
         config.get_endpoint_paths.return_value = {
             "db": "/mcp/xmlrpc/db",
@@ -95,8 +97,8 @@ class TestOdooConnectionCaching:
             # Should call server twice
             assert mock_execute.call_count == 2
 
-    def test_read_caching(self, mock_config, mock_performance_manager):
-        """Test read method uses cache."""
+    def test_read_always_fetches_fresh_data(self, mock_config, mock_performance_manager):
+        """Test read method always fetches fresh data (record caching disabled)."""
         conn = OdooConnection(mock_config, performance_manager=mock_performance_manager)
 
         # Mock the connection
@@ -117,18 +119,10 @@ class TestOdooConnectionCaching:
             assert len(records1) == 2
             mock_execute.assert_called_once()
 
-            # Second read of same records should use cache
+            # Second read should also hit server (no caching)
             records2 = conn.read("res.partner", [1, 2])
             assert records2 == records1
-            mock_execute.assert_called_once()  # Still only called once
-
-            # Read with one cached and one new record
-            mock_execute.return_value = [{"id": 3, "name": "Partner 3"}]
-            records3 = conn.read("res.partner", [1, 3])
-            assert len(records3) == 2
-            assert records3[0]["id"] == 1  # Cached
-            assert records3[1]["id"] == 3  # New
-            assert mock_execute.call_count == 2  # Called again for record 3
+            assert mock_execute.call_count == 2  # Called twice - no caching
 
     def test_read_cache_respects_fields(self, mock_config, mock_performance_manager):
         """Test read cache respects requested fields."""

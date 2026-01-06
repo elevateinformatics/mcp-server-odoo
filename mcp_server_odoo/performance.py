@@ -570,8 +570,8 @@ class PerformanceManager:
             fields: Field definitions
         """
         key = self.cache_key("fields", model=model)
-        # Fields rarely change, cache for 1 hour
-        self.field_cache.put(key, fields, ttl_seconds=3600)
+        # Fields rarely change, use configured TTL (default 1 hour)
+        self.field_cache.put(key, fields, ttl_seconds=self.config.cache_field_ttl)
 
     def get_cached_record(
         self, model: str, record_id: int, fields: Optional[List[str]] = None
@@ -594,20 +594,20 @@ class PerformanceManager:
         model: str,
         record: Dict[str, Any],
         fields: Optional[List[str]] = None,
-        ttl_seconds: int = 300,
+        ttl_seconds: Optional[int] = None,
     ):
         """Cache record data.
+
+        NOTE: Record caching is disabled - always fetch fresh data from Odoo.
 
         Args:
             model: Model name
             record: Record data
             fields: Field list (for cache key)
-            ttl_seconds: Cache TTL
+            ttl_seconds: Cache TTL (unused)
         """
-        record_id = record.get("id")
-        if record_id is not None:
-            key = self.cache_key("record", model=model, id=record_id, fields=fields)
-            self.record_cache.put(key, record, ttl_seconds=ttl_seconds)
+        # Disabled: always fetch fresh data from Odoo
+        pass
 
     def invalidate_record_cache(self, model: str, record_id: Optional[int] = None):
         """Invalidate record cache.
@@ -650,8 +650,7 @@ class PerformanceManager:
             allowed: Permission result
         """
         key = self.cache_key("permission", model=model, operation=operation, user_id=user_id)
-        # Permissions may change, cache for 5 minutes
-        self.permission_cache.put(key, allowed, ttl_seconds=300)
+        self.permission_cache.put(key, allowed, ttl_seconds=self.config.cache_permission_ttl)
 
     def get_optimized_connection(self, endpoint: str) -> Any:
         """Get optimized connection from pool.
