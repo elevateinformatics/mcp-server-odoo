@@ -33,9 +33,9 @@ class TestPackageStructure:
         """Test that the package can be imported."""
         import mcp_server_odoo
 
-        # Check version
+        # Check version exists (don't hardcode value)
         assert hasattr(mcp_server_odoo, "__version__")
-        assert mcp_server_odoo.__version__ == "0.1.0"
+        assert mcp_server_odoo.__version__  # Just check it's not empty
 
         # Check main class
         assert hasattr(mcp_server_odoo, "OdooMCPServer")
