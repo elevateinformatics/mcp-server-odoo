@@ -27,21 +27,17 @@ logger = get_logger(__name__)
 
 
 class GzipTransport(Transport):
-    """XML-RPC Transport with gzip compression support.
+    """XML-RPC Transport with gzip response decompression support.
 
     Sends Accept-Encoding: gzip header and handles gzip responses.
-    Also compresses request bodies for better upload performance.
+    Note: Request compression is not used as Odoo doesn't support it.
     """
 
     def request(self, host, handler, request_body, verbose=False):
-        """Send XML-RPC request with gzip support."""
-        # Compress request body
-        compressed_body = gzip.compress(request_body)
-
+        """Send XML-RPC request with gzip response support."""
         headers = [
             ("Content-Type", "text/xml"),
-            ("Content-Encoding", "gzip"),
-            ("Accept-Encoding", "gzip"),
+            ("Accept-Encoding", "gzip, deflate"),
         ]
 
         # Use parent's connection handling
@@ -51,8 +47,8 @@ class GzipTransport(Transport):
             connection.putrequest("POST", handler)
             for header, value in headers:
                 connection.putheader(header, value)
-            connection.putheader("Content-Length", str(len(compressed_body)))
-            connection.endheaders(compressed_body)
+            connection.putheader("Content-Length", str(len(request_body)))
+            connection.endheaders(request_body)
 
             response = connection.getresponse()
 
@@ -61,7 +57,8 @@ class GzipTransport(Transport):
 
             # Handle gzip response
             response_data = response.read()
-            if response.getheader("Content-Encoding") == "gzip":
+            content_encoding = response.getheader("Content-Encoding", "").lower()
+            if "gzip" in content_encoding:
                 response_data = gzip.decompress(response_data)
 
             return self.parse_response(response_data)
@@ -81,17 +78,17 @@ class GzipTransport(Transport):
 
 
 class GzipSafeTransport(SafeTransport):
-    """XML-RPC SafeTransport with gzip compression support for HTTPS."""
+    """XML-RPC SafeTransport with gzip response decompression for HTTPS.
+
+    Sends Accept-Encoding: gzip header and handles gzip responses.
+    Note: Request compression is not used as Odoo doesn't support it.
+    """
 
     def request(self, host, handler, request_body, verbose=False):
-        """Send XML-RPC request with gzip support over HTTPS."""
-        # Compress request body
-        compressed_body = gzip.compress(request_body)
-
+        """Send XML-RPC request with gzip response support over HTTPS."""
         headers = [
             ("Content-Type", "text/xml"),
-            ("Content-Encoding", "gzip"),
-            ("Accept-Encoding", "gzip"),
+            ("Accept-Encoding", "gzip, deflate"),
         ]
 
         # Use parent's connection handling
@@ -101,8 +98,8 @@ class GzipSafeTransport(SafeTransport):
             connection.putrequest("POST", handler)
             for header, value in headers:
                 connection.putheader(header, value)
-            connection.putheader("Content-Length", str(len(compressed_body)))
-            connection.endheaders(compressed_body)
+            connection.putheader("Content-Length", str(len(request_body)))
+            connection.endheaders(request_body)
 
             response = connection.getresponse()
 
@@ -111,7 +108,8 @@ class GzipSafeTransport(SafeTransport):
 
             # Handle gzip response
             response_data = response.read()
-            if response.getheader("Content-Encoding") == "gzip":
+            content_encoding = response.getheader("Content-Encoding", "").lower()
+            if "gzip" in content_encoding:
                 response_data = gzip.decompress(response_data)
 
             return self.parse_response(response_data)

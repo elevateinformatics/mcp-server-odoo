@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black:*)"
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black:*)",
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black .)",
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m ruff check .)",
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -q --tb=line)"
     ]
   }
 }
