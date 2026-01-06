@@ -74,7 +74,7 @@ Add this configuration to your MCP settings:
   "mcpServers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here"
@@ -94,7 +94,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -112,7 +112,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -135,7 +135,7 @@ Add to `~/.cursor/mcp_settings.json`:
   "mcpServers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -157,7 +157,7 @@ Add to your VS Code settings (`~/.vscode/mcp_settings.json` or workspace setting
   "github.copilot.chat.mcpServers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -179,7 +179,7 @@ Add to `~/.config/zed/settings.json`:
   "context_servers": {
     "odoo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -198,13 +198,13 @@ Add to `~/.config/zed/settings.json`:
 
 ```bash
 # Install globally
-pip install mcp-server-odoo
+pip install mcp-server-odoo-ei
 
 # Or use pipx for isolated environment
-pipx install mcp-server-odoo
+pipx install mcp-server-odoo-ei
 ```
 
-Then use `mcp-server-odoo` as the command in your MCP configuration.
+Then use `mcp-server-odoo-ei` as the command in your MCP configuration.
 </details>
 
 <details>
@@ -251,7 +251,7 @@ Standard input/output transport - used by desktop AI applications like Claude De
 
 ```bash
 # Default transport - no additional configuration needed
-uvx mcp-server-odoo
+uvx mcp-server-odoo-ei
 ```
 
 #### 2. **streamable-http**
@@ -259,13 +259,13 @@ Standard HTTP transport for REST API-style access and remote connectivity.
 
 ```bash
 # Run with HTTP transport
-uvx mcp-server-odoo --transport streamable-http --host 0.0.0.0 --port 8000
+uvx mcp-server-odoo-ei --transport streamable-http --host 0.0.0.0 --port 8000
 
 # Or use environment variables
 export ODOO_MCP_TRANSPORT=streamable-http
 export ODOO_MCP_HOST=0.0.0.0
 export ODOO_MCP_PORT=8000
-uvx mcp-server-odoo
+uvx mcp-server-odoo-ei
 ```
 
 The HTTP endpoint will be available at: `http://localhost:8000/mcp/`
@@ -288,7 +288,7 @@ The HTTP endpoint will be available at: `http://localhost:8000/mcp/`
   "mcpServers": {
     "odoo-remote": {
       "command": "uvx",
-      "args": ["mcp-server-odoo", "--transport", "streamable-http", "--port", "8080"],
+      "args": ["mcp-server-odoo-ei", "--transport", "streamable-http", "--port", "8080"],
       "env": {
         "ODOO_URL": "https://your-odoo-instance.com",
         "ODOO_API_KEY": "your-api-key-here",
@@ -348,7 +348,7 @@ YOLO mode allows the MCP server to connect directly to any standard Odoo instanc
   "mcpServers": {
     "odoo-demo": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "http://localhost:8069",
         "ODOO_USER": "admin",
@@ -370,7 +370,7 @@ YOLO mode allows the MCP server to connect directly to any standard Odoo instanc
   "mcpServers": {
     "odoo-test": {
       "command": "uvx",
-      "args": ["mcp-server-odoo"],
+      "args": ["mcp-server-odoo-ei"],
       "env": {
         "ODOO_URL": "http://localhost:8069",
         "ODOO_USER": "admin",
@@ -616,7 +616,7 @@ Then update your config:
 ```json
 {
   "command": "/Users/yourname/.local/bin/uvx",
-  "args": ["mcp-server-odoo"]
+  "args": ["mcp-server-odoo-ei"]
 }
 ```
 </details>
@@ -704,7 +704,7 @@ python -m mcp_server_odoo
 
 ```bash
 # Using uvx
-npx @modelcontextprotocol/inspector uvx mcp-server-odoo
+npx @modelcontextprotocol/inspector uvx mcp-server-odoo-ei
 
 # Using local installation
 npx @modelcontextprotocol/inspector python -m mcp_server_odoo

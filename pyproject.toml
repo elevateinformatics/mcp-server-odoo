@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-odoo-ei"
-version = "0.3.2"
+version = "0.3.3"
 description = "A Model Context Protocol server for Odoo ERP systems"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -57,7 +57,7 @@ dev = [
 ]
 
 [project.scripts]
-mcp-server-odoo = "mcp_server_odoo.__main__:main"
+mcp-server-odoo-ei = "mcp_server_odoo.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_server_odoo"]
