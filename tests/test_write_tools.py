@@ -76,9 +76,7 @@ class TestWriteTools:
         )
         assert "Successfully created" in result["message"]
         mock_connection.create.assert_called_once_with(model, values)
-        mock_connection.read.assert_called_once_with(
-            model, [created_id], ["id", "display_name"]
-        )
+        mock_connection.read.assert_called_once_with(model, [created_id], ["id", "display_name"])
 
     @pytest.mark.asyncio
     async def test_create_record_no_values(self, tool_handler):
