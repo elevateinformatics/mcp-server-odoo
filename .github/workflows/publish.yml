@@ -41,5 +41,4 @@ jobs:
       with:
         verbose: true
         print-hash: true
-        # If using API token instead of trusted publishing:
-        # password: ${{ secrets.PYPI_API_TOKEN }}
+        password: ${{ secrets.PYPI_API_TOKEN }}
