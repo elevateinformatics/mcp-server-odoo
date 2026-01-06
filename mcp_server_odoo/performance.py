@@ -5,8 +5,11 @@ This module provides performance optimizations including:
 - Intelligent response caching
 - Request batching and optimization
 - Performance monitoring and metrics
+- Gzip compression for requests and responses
 """
 
+import gzip
+import http.client
 import json
 import threading
 import time
@@ -21,6 +24,112 @@ from .config import OdooConfig
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+class GzipTransport(Transport):
+    """XML-RPC Transport with gzip compression support.
+
+    Sends Accept-Encoding: gzip header and handles gzip responses.
+    Also compresses request bodies for better upload performance.
+    """
+
+    def request(self, host, handler, request_body, verbose=False):
+        """Send XML-RPC request with gzip support."""
+        # Compress request body
+        compressed_body = gzip.compress(request_body)
+
+        headers = [
+            ("Content-Type", "text/xml"),
+            ("Content-Encoding", "gzip"),
+            ("Accept-Encoding", "gzip"),
+        ]
+
+        # Use parent's connection handling
+        connection = self.make_connection(host)
+
+        try:
+            connection.putrequest("POST", handler)
+            for header, value in headers:
+                connection.putheader(header, value)
+            connection.putheader("Content-Length", str(len(compressed_body)))
+            connection.endheaders(compressed_body)
+
+            response = connection.getresponse()
+
+            if response.status != 200:
+                raise http.client.HTTPException(f"HTTP error: {response.status} {response.reason}")
+
+            # Handle gzip response
+            response_data = response.read()
+            if response.getheader("Content-Encoding") == "gzip":
+                response_data = gzip.decompress(response_data)
+
+            return self.parse_response(response_data)
+
+        except Exception:
+            connection.close()
+            raise
+
+    def parse_response(self, response_data):
+        """Parse XML-RPC response from bytes."""
+        from io import BytesIO
+        from xmlrpc.client import Unmarshaller, getparser
+
+        p, u = getparser()
+        p.feed(response_data)
+        p.close()
+        return u.close()
+
+
+class GzipSafeTransport(SafeTransport):
+    """XML-RPC SafeTransport with gzip compression support for HTTPS."""
+
+    def request(self, host, handler, request_body, verbose=False):
+        """Send XML-RPC request with gzip support over HTTPS."""
+        # Compress request body
+        compressed_body = gzip.compress(request_body)
+
+        headers = [
+            ("Content-Type", "text/xml"),
+            ("Content-Encoding", "gzip"),
+            ("Accept-Encoding", "gzip"),
+        ]
+
+        # Use parent's connection handling
+        connection = self.make_connection(host)
+
+        try:
+            connection.putrequest("POST", handler)
+            for header, value in headers:
+                connection.putheader(header, value)
+            connection.putheader("Content-Length", str(len(compressed_body)))
+            connection.endheaders(compressed_body)
+
+            response = connection.getresponse()
+
+            if response.status != 200:
+                raise http.client.HTTPException(f"HTTP error: {response.status} {response.reason}")
+
+            # Handle gzip response
+            response_data = response.read()
+            if response.getheader("Content-Encoding") == "gzip":
+                response_data = gzip.decompress(response_data)
+
+            return self.parse_response(response_data)
+
+        except Exception:
+            connection.close()
+            raise
+
+    def parse_response(self, response_data):
+        """Parse XML-RPC response from bytes."""
+        from io import BytesIO
+        from xmlrpc.client import Unmarshaller, getparser
+
+        p, u = getparser()
+        p.feed(response_data)
+        p.close()
+        return u.close()
 
 
 @dataclass
@@ -271,11 +380,13 @@ class ConnectionPool:
         self._connections: List[Tuple[ServerProxy, float]] = []
         self._endpoint_map: List[str] = []  # Track endpoints for each connection
         self._lock = threading.RLock()
-        # Use SafeTransport for HTTPS, regular Transport for HTTP
+        # Use Gzip-enabled transports for compression support
+        # GzipSafeTransport for HTTPS, GzipTransport for HTTP
         if config.url.startswith("https://"):
-            self._transport = SafeTransport()
+            self._transport = GzipSafeTransport()
         else:
-            self._transport = Transport()
+            self._transport = GzipTransport()
+        logger.info("Connection pool initialized with gzip compression support")
         self._last_cleanup = time.time()
         self._stats = {
             "connections_created": 0,

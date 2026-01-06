@@ -427,7 +427,7 @@ class TestLoggingConfiguration:
 
         # Clean up - close handlers first to release file lock on Windows
         for handler in logging.root.handlers[:]:
-            if hasattr(handler, 'baseFilename') and handler.baseFilename == tmp_name:
+            if hasattr(handler, "baseFilename") and handler.baseFilename == tmp_name:
                 handler.close()
                 logging.root.removeHandler(handler)
         os.unlink(tmp_name)
