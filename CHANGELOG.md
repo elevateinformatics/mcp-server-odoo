@@ -7,16 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-01-06
+
+### Fixed
+- **Model Compatibility**: Fixed `create_record` and `update_record` to support models without `name` field (e.g., `survey.survey` which uses `title`)
+  - Removed `name` from essential fields, now only returns `id` and `display_name`
+  - `display_name` is a computed field that exists in all Odoo models
+
+### Changed
+- **CI/CD**: Updated PyPI publish workflow to use API token authentication
+
+## [0.3.0] - 2025-11-18
+
 ### Added
 - **Multi-Language Support**: Added `ODOO_LOCALE` environment variable to request Odoo responses in different languages
   - Automatically injects language context into all Odoo API calls
   - Supports any locale installed in your Odoo instance (es_ES, es_AR, fr_FR, etc.)
   - Returns translated field labels, selection values, and error messages
   - Preserves existing context values when locale is added
-
-## [0.3.0] - 2025-09-14
-
-### Added
 - **YOLO Mode**: Development mode for testing without MCP module installation
   - Read-Only: Safe demo mode with read-only access to all models
   - Full Access: Unrestricted access for development (never use in production)
