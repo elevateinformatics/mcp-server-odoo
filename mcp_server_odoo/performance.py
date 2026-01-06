@@ -72,8 +72,7 @@ class GzipTransport(Transport):
 
     def parse_response(self, response_data):
         """Parse XML-RPC response from bytes."""
-        from io import BytesIO
-        from xmlrpc.client import Unmarshaller, getparser
+        from xmlrpc.client import getparser
 
         p, u = getparser()
         p.feed(response_data)
@@ -123,8 +122,7 @@ class GzipSafeTransport(SafeTransport):
 
     def parse_response(self, response_data):
         """Parse XML-RPC response from bytes."""
-        from io import BytesIO
-        from xmlrpc.client import Unmarshaller, getparser
+        from xmlrpc.client import getparser
 
         p, u = getparser()
         p.feed(response_data)

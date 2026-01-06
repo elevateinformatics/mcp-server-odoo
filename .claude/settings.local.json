@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black:*)"
+    ]
+  }
+}

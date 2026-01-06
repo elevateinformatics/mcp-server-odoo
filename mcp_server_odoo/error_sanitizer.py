@@ -6,7 +6,7 @@ useful information for debugging.
 """
 
 import re
-from typing import Any, Dict, List, Optional, Pattern, Tuple
+from typing import Any, Dict, Optional, Pattern
 
 # Pre-compiled regex patterns for better performance
 _WHITESPACE_PATTERN: Pattern[str] = re.compile(r"\s+")

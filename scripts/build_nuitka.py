@@ -87,7 +87,7 @@ def build_nuitka(
     # Add the entry point
     cmd.append(str(entry_point))
 
-    print(f"Building with Nuitka...")
+    print("Building with Nuitka...")
     print(f"Command: {' '.join(cmd)}")
     print()
 
@@ -96,7 +96,7 @@ def build_nuitka(
 
     if result.returncode == 0:
         print()
-        print(f"Build successful!")
+        print("Build successful!")
         print(f"Output: {output_dir}/{output_name}")
     else:
         print()
