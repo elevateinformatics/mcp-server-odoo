@@ -28,6 +28,12 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🌐 **Locale Support**: with the variable ODOO_LOCALE you can set the language (es_AR).
 
 
+## Like it ?
+
+Thank you for using this project! If you find it helpful and would like to support my work, kindly consider buying me a coffee. Your support is greatly appreciated!
+
+<a href="https://www.buymeacoffee.com/lucianobustos" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
 ## Installation
 
 ### Prerequisites
@@ -740,11 +746,5 @@ This project is licensed under the Mozilla Public License 2.0 (MPL-2.0) - see th
 ## Contributing
 
 Contributions are very welcome! Please see the [CONTRIBUTING](CONTRIBUTING.md) guide for details.
-
-## Support
-
-Thank you for using this project! If you find it helpful and would like to support my work, kindly consider buying me a coffee. Your support is greatly appreciated!
-
-<a href="https://www.buymeacoffee.com/lucianobustos" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
 And do not forget to give the project a star if you like it! :star:
