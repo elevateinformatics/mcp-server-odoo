@@ -4,16 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-odoo-ei"
-version = "0.3.1"
+version = "0.3.2"
 description = "A Model Context Protocol server for Odoo ERP systems"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" },
     { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" }
 ]
 maintainers = [
-    { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" },
     { name = "Luciano Bustos", email = "luciano.bustos@elevateinformatics.com" }
 ]
 license = { text = "MPL-2.0" }
