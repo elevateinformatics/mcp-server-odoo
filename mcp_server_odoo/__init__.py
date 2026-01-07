@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+__version__: str
 try:
     __version__ = version("mcp-server-odoo-ei")
 except PackageNotFoundError:
