@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-01-07
+
+### Added
+- **Batch Read Tool**: Added `read_records` tool for reading multiple records by ID in a single API call
+  - More efficient than calling `get_record` multiple times
+  - Supports smart field selection or explicit field list
+  - Returns found records and reports any missing IDs (non-blocking)
+
 ## [0.4.2] - 2026-01-07
 
 ### Added

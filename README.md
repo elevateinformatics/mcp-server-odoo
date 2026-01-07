@@ -17,7 +17,7 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🔍 **Search and retrieve** any Odoo record (customers, products, invoices, etc.)
 - ✨ **Create new records** with field validation and permission checks
 - ✏️ **Update existing data** with smart field handling
-- ⚡ **Batch update records** - update multiple records in a single API call
+- ⚡ **Batch operations** - read/update multiple records in a single API call
 - 🗑️ **Delete records** respecting model-level permissions
 - 📊 **Browse multiple records** and get formatted summaries
 - 🔢 **Count records** matching specific criteria
@@ -496,6 +496,19 @@ Retrieve a specific record by ID.
 - Omit `fields` or set to `null`: Returns smart selection of common fields with metadata
 - Specify field list: Returns only those specific fields
 - Use `["__all__"]`: Returns all fields without metadata
+
+### `read_records`
+Read multiple records by their IDs in a single API call (batch operation).
+
+```json
+{
+  "model": "res.partner",
+  "record_ids": [1, 2, 3, 4, 5],
+  "fields": ["name", "email", "phone"]
+}
+```
+
+This is more efficient than calling `get_record` multiple times when you need to retrieve specific records by ID. Returns found records and reports any missing IDs.
 
 ### `list_models`
 List all models enabled for MCP access.

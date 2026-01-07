@@ -690,6 +690,216 @@ class TestRegisterTools:
         assert handler.config == config
 
 
+class TestReadRecordsTool:
+    """Test cases for read_records batch tool."""
+
+    @pytest.fixture
+    def mock_app(self):
+        """Create a mock FastMCP app."""
+        app = MagicMock(spec=FastMCP)
+        app._tools = {}
+
+        def tool_decorator():
+            def decorator(func):
+                app._tools[func.__name__] = func
+                return func
+
+            return decorator
+
+        app.tool = tool_decorator
+        return app
+
+    @pytest.fixture
+    def mock_connection(self):
+        """Create a mock OdooConnection."""
+        connection = MagicMock(spec=OdooConnection)
+        connection.is_authenticated = True
+        return connection
+
+    @pytest.fixture
+    def mock_access_controller(self):
+        """Create a mock AccessController."""
+        controller = MagicMock(spec=AccessController)
+        return controller
+
+    @pytest.fixture
+    def valid_config(self):
+        """Create a valid config."""
+        return OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            database="test_db",
+            default_limit=10,
+            max_limit=100,
+        )
+
+    @pytest.fixture
+    def handler(self, mock_app, mock_connection, mock_access_controller, valid_config):
+        """Create an OdooToolHandler instance."""
+        from mcp_server_odoo.tools import OdooToolHandler
+
+        return OdooToolHandler(mock_app, mock_connection, mock_access_controller, valid_config)
+
+    def test_read_records_tool_registered(self, handler, mock_app):
+        """Test that read_records tool is registered."""
+        assert "read_records" in mock_app._tools
+
+    @pytest.mark.asyncio
+    async def test_read_records_success(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test successful batch read of multiple records."""
+        # Setup mocks
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.read.return_value = [
+            {"id": 1, "name": "Partner 1", "email": "p1@test.com"},
+            {"id": 2, "name": "Partner 2", "email": "p2@test.com"},
+            {"id": 3, "name": "Partner 3", "email": "p3@test.com"},
+        ]
+
+        read_records = mock_app._tools["read_records"]
+
+        result = await read_records(
+            model="res.partner",
+            record_ids=[1, 2, 3],
+            fields=["name", "email"],
+        )
+
+        # Verify result
+        assert result["count"] == 3
+        assert len(result["records"]) == 3
+        assert result["missing_ids"] == []
+
+        # Verify access control was checked
+        mock_access_controller.validate_model_access.assert_called_once_with("res.partner", "read")
+
+        # Verify read was called with all IDs at once
+        mock_connection.read.assert_called_once_with("res.partner", [1, 2, 3], ["name", "email"])
+
+    @pytest.mark.asyncio
+    async def test_read_records_with_missing_ids(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test read_records when some IDs don't exist."""
+        mock_access_controller.validate_model_access.return_value = None
+        # Only 2 of 3 records exist
+        mock_connection.read.return_value = [
+            {"id": 1, "name": "Partner 1"},
+            {"id": 2, "name": "Partner 2"},
+        ]
+
+        read_records = mock_app._tools["read_records"]
+
+        result = await read_records(
+            model="res.partner",
+            record_ids=[1, 2, 3],
+            fields=["name"],
+        )
+
+        # Should return found records and report missing IDs
+        assert result["count"] == 2
+        assert len(result["records"]) == 2
+        assert result["missing_ids"] == [3]
+
+    @pytest.mark.asyncio
+    async def test_read_records_empty_ids_fails(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test that empty record_ids list raises validation error."""
+        read_records = mock_app._tools["read_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await read_records(
+                model="res.partner",
+                record_ids=[],
+                fields=["name"],
+            )
+
+        assert "No record IDs provided" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_read_records_access_denied(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test read_records with access denied."""
+        mock_access_controller.validate_model_access.side_effect = AccessControlError(
+            "Access denied"
+        )
+
+        read_records = mock_app._tools["read_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await read_records(
+                model="res.partner",
+                record_ids=[1, 2, 3],
+                fields=["name"],
+            )
+
+        assert "Access denied" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_read_records_not_authenticated(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test read_records when not authenticated."""
+        mock_connection.is_authenticated = False
+
+        read_records = mock_app._tools["read_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await read_records(
+                model="res.partner",
+                record_ids=[1, 2, 3],
+                fields=["name"],
+            )
+
+        assert "Not authenticated" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_read_records_connection_error(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test read_records with connection error."""
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.read.side_effect = OdooConnectionError("Connection lost")
+
+        read_records = mock_app._tools["read_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await read_records(
+                model="res.partner",
+                record_ids=[1, 2, 3],
+                fields=["name"],
+            )
+
+        assert "Connection error" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_read_records_with_smart_defaults(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test read_records uses smart field selection when fields is None."""
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.fields_get.return_value = {
+            "id": {"type": "integer"},
+            "name": {"type": "char", "required": True},
+            "email": {"type": "char"},
+        }
+        mock_connection.read.return_value = [
+            {"id": 1, "name": "Partner 1"},
+        ]
+
+        read_records = mock_app._tools["read_records"]
+
+        result = await read_records(
+            model="res.partner",
+            record_ids=[1],
+            fields=None,  # Should use smart defaults
+        )
+
+        assert result["count"] == 1
+
+
 class TestUpdateRecordsTool:
     """Test cases for update_records batch tool."""
 
