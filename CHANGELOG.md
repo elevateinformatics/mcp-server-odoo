@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-01-07
+
+### Added
+- **Batch Create Tool**: Added `create_records` tool for creating multiple records in a single API call
+  - More efficient than calling `create_record` multiple times
+  - Validates all records before creation
+  - Returns all created records with id and display_name
+
 ## [0.4.3] - 2026-01-07
 
 ### Added

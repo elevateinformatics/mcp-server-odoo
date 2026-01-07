@@ -544,6 +544,36 @@ class OdooToolHandler:
             return await self._handle_create_record_tool(model, values)
 
         @self.app.tool()
+        async def create_records(
+            model: str,
+            records: List[Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            """Create multiple records in a single API call (batch operation).
+
+            This is more efficient than calling create_record multiple times
+            when you need to create many records of the same model.
+
+            Args:
+                model: The Odoo model name (e.g., 'project.task')
+                records: List of dictionaries, each containing field values for a record
+
+            Returns:
+                Dictionary with creation results:
+                - success: Boolean indicating if creation succeeded
+                - created_count: Number of records created
+                - records: List of created records with id and display_name
+
+            Example:
+                # Create 3 tasks in a single call
+                create_records("project.task", [
+                    {"name": "Task 1", "project_id": 19},
+                    {"name": "Task 2", "project_id": 19},
+                    {"name": "Task 3", "project_id": 19}
+                ])
+            """
+            return await self._handle_create_records_tool(model, records)
+
+        @self.app.tool()
         async def update_record(
             model: str,
             record_id: int,
@@ -1142,6 +1172,69 @@ class OdooToolHandler:
             logger.error(f"Error in create_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ToolError(f"Failed to create record: {sanitized_msg}") from e
+
+    async def _handle_create_records_tool(
+        self,
+        model: str,
+        records: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Handle create records (batch) tool request."""
+        try:
+            with perf_logger.track_operation("tool_create_records", model=model):
+                # Check model access
+                self.access_controller.validate_model_access(model, "create")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate input
+                if not records:
+                    raise ValidationError("No records provided for batch creation")
+
+                if not isinstance(records, list):
+                    raise ValidationError("Records must be a list of dictionaries")
+
+                for i, record in enumerate(records):
+                    if not isinstance(record, dict):
+                        raise ValidationError(f"Record at index {i} must be a dictionary")
+                    if not record:
+                        raise ValidationError(f"Record at index {i} is empty")
+
+                # Create all records in a single API call
+                # Odoo's create method accepts a list of dicts and returns a list of IDs
+                record_ids = self.connection.create(model, records)
+
+                # Handle single ID return (when only one record was created)
+                if isinstance(record_ids, int):
+                    record_ids = [record_ids]
+
+                # Read essential fields for all created records
+                essential_fields = ["id", "display_name"]
+                created_records = self.connection.read(model, record_ids, essential_fields)
+
+                # Process dates in the records
+                created_records = [
+                    self._process_record_dates(record, model) for record in created_records
+                ]
+
+                return {
+                    "success": True,
+                    "created_count": len(record_ids),
+                    "records": created_records,
+                    "message": f"Successfully created {len(record_ids)} {model} records",
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in create_records tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to create records: {sanitized_msg}") from e
 
     async def _handle_update_record_tool(
         self,

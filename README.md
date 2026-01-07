@@ -17,7 +17,7 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🔍 **Search and retrieve** any Odoo record (customers, products, invoices, etc.)
 - ✨ **Create new records** with field validation and permission checks
 - ✏️ **Update existing data** with smart field handling
-- ⚡ **Batch operations** - read/update multiple records in a single API call
+- ⚡ **Batch operations** - create/read/update multiple records in a single API call
 - 🗑️ **Delete records** respecting model-level permissions
 - 📊 **Browse multiple records** and get formatted summaries
 - 🔢 **Count records** matching specific criteria

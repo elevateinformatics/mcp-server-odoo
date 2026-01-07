@@ -997,28 +997,35 @@ class OdooConnection:
         """
         return self.execute_kw(model, "search_count", [domain], {})
 
-    def create(self, model: str, values: Dict[str, Any]) -> int:
-        """Create a new record.
+    def create(
+        self, model: str, values: Union[Dict[str, Any], List[Dict[str, Any]]]
+    ) -> Union[int, List[int]]:
+        """Create one or more records.
 
         Args:
             model: The Odoo model name
-            values: Dictionary of field values for the new record
+            values: Dictionary of field values for a single record,
+                   or a list of dictionaries for batch creation
 
         Returns:
-            ID of the created record
+            ID of the created record (int) for single creation,
+            or list of IDs (List[int]) for batch creation
 
         Raises:
             OdooConnectionError: If creation fails
         """
         try:
             with self._performance_manager.monitor.track_operation(f"create_{model}"):
-                record_id = self.execute_kw(model, "create", [values], {})
+                result = self.execute_kw(model, "create", [values], {})
                 # Invalidate cache for this model
                 self._performance_manager.invalidate_record_cache(model)
-                logger.info(f"Created {model} record with ID {record_id}")
-                return record_id
+                if isinstance(values, list):
+                    logger.info(f"Created {len(result)} {model} records with IDs {result}")
+                else:
+                    logger.info(f"Created {model} record with ID {result}")
+                return result
         except Exception as e:
-            logger.error(f"Failed to create {model} record: {e}")
+            logger.error(f"Failed to create {model} record(s): {e}")
             raise
 
     def write(self, model: str, ids: List[int], values: Dict[str, Any]) -> bool:
