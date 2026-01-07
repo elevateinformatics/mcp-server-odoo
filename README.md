@@ -17,6 +17,7 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🔍 **Search and retrieve** any Odoo record (customers, products, invoices, etc.)
 - ✨ **Create new records** with field validation and permission checks
 - ✏️ **Update existing data** with smart field handling
+- ⚡ **Batch update records** - update multiple records in a single API call
 - 🗑️ **Delete records** respecting model-level permissions
 - 📊 **Browse multiple records** and get formatted summaries
 - 🔢 **Count records** matching specific criteria
@@ -530,6 +531,21 @@ Update an existing record.
   }
 }
 ```
+
+### `update_records`
+Update multiple records with the same values in a single API call (batch operation).
+
+```json
+{
+  "model": "project.task",
+  "record_ids": [1, 2, 3, 4, 5],
+  "values": {
+    "display_in_project": true
+  }
+}
+```
+
+This is much more efficient than calling `update_record` multiple times when you need to apply the same changes to many records.
 
 ### `delete_record`
 Delete a record from Odoo.

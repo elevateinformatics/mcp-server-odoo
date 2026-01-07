@@ -533,6 +533,34 @@ class OdooToolHandler:
             return await self._handle_update_record_tool(model, record_id, values)
 
         @self.app.tool()
+        async def update_records(
+            model: str,
+            record_ids: List[int],
+            values: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            """Update multiple records with the same values (batch operation).
+
+            This is more efficient than calling update_record multiple times
+            when you need to apply the same changes to many records.
+
+            Args:
+                model: The Odoo model name (e.g., 'project.task')
+                record_ids: List of record IDs to update
+                values: Field values to apply to all records
+
+            Returns:
+                Dictionary with update confirmation:
+                - success: Boolean indicating if update succeeded
+                - updated_count: Number of records updated
+                - record_ids: List of updated record IDs
+
+            Example:
+                # Update 85 tasks in a single call
+                update_records("project.task", [1, 2, 3, ...], {"display_in_project": True})
+            """
+            return await self._handle_update_records_tool(model, record_ids, values)
+
+        @self.app.tool()
         async def delete_record(
             model: str,
             record_id: int,
@@ -1090,6 +1118,60 @@ class OdooToolHandler:
             logger.error(f"Error in update_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ToolError(f"Failed to update record: {sanitized_msg}") from e
+
+    async def _handle_update_records_tool(
+        self,
+        model: str,
+        record_ids: List[int],
+        values: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Handle update records (batch) tool request."""
+        try:
+            with perf_logger.track_operation("tool_update_records", model=model):
+                # Check model access
+                self.access_controller.validate_model_access(model, "write")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate input
+                if not record_ids:
+                    raise ValidationError("No record IDs provided for batch update")
+
+                if not values:
+                    raise ValidationError("No values provided for batch update")
+
+                # Verify all records exist (fetch only IDs to minimize overhead)
+                existing = self.connection.read(model, record_ids, ["id"])
+                existing_ids = {record["id"] for record in existing}
+                missing_ids = set(record_ids) - existing_ids
+
+                if missing_ids:
+                    raise ValidationError(
+                        f"Records not found: {model} with IDs {sorted(missing_ids)}"
+                    )
+
+                # Perform batch update (single API call)
+                success = self.connection.write(model, record_ids, values)
+
+                return {
+                    "success": success,
+                    "updated_count": len(record_ids),
+                    "record_ids": record_ids,
+                    "message": f"Successfully updated {len(record_ids)} {model} records",
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in update_records tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to update records: {sanitized_msg}") from e
 
     async def _handle_delete_record_tool(
         self,

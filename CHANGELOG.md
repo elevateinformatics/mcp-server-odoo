@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-01-07
+
+### Added
+- **Batch Update Tool**: Added `update_records` tool for updating multiple records in a single API call (#2)
+  - More efficient than calling `update_record` multiple times
+  - Validates all record IDs exist before updating
+  - Atomic operation - if one fails, all fail
+  - Returns count of updated records and their IDs
+
 ## [0.3.2] - 2026-01-06
 
 ### Changed
