@@ -690,6 +690,214 @@ class TestRegisterTools:
         assert handler.config == config
 
 
+class TestUpdateRecordsTool:
+    """Test cases for update_records batch tool."""
+
+    @pytest.fixture
+    def mock_app(self):
+        """Create a mock FastMCP app."""
+        app = MagicMock(spec=FastMCP)
+        app._tools = {}
+
+        def tool_decorator():
+            def decorator(func):
+                app._tools[func.__name__] = func
+                return func
+
+            return decorator
+
+        app.tool = tool_decorator
+        return app
+
+    @pytest.fixture
+    def mock_connection(self):
+        """Create a mock OdooConnection."""
+        connection = MagicMock(spec=OdooConnection)
+        connection.is_authenticated = True
+        return connection
+
+    @pytest.fixture
+    def mock_access_controller(self):
+        """Create a mock AccessController."""
+        controller = MagicMock(spec=AccessController)
+        return controller
+
+    @pytest.fixture
+    def valid_config(self):
+        """Create a valid config."""
+        return OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            database="test_db",
+            default_limit=10,
+            max_limit=100,
+        )
+
+    @pytest.fixture
+    def handler(self, mock_app, mock_connection, mock_access_controller, valid_config):
+        """Create an OdooToolHandler instance."""
+        from mcp_server_odoo.tools import OdooToolHandler
+
+        return OdooToolHandler(mock_app, mock_connection, mock_access_controller, valid_config)
+
+    def test_update_records_tool_registered(self, handler, mock_app):
+        """Test that update_records tool is registered."""
+        assert "update_records" in mock_app._tools
+
+    @pytest.mark.asyncio
+    async def test_update_records_success(
+        self, handler, mock_connection, mock_access_controller, mock_app, valid_config
+    ):
+        """Test successful batch update of multiple records."""
+        # Setup mocks
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.read.return_value = [
+            {"id": 1},
+            {"id": 2},
+            {"id": 3},
+        ]
+        mock_connection.write.return_value = True
+
+        # Get the registered update_records function
+        update_records = mock_app._tools["update_records"]
+
+        # Call the tool
+        result = await update_records(
+            model="project.task",
+            record_ids=[1, 2, 3],
+            values={"display_in_project": True},
+        )
+
+        # Verify result
+        assert result["success"] is True
+        assert result["updated_count"] == 3
+        assert result["record_ids"] == [1, 2, 3]
+
+        # Verify access control was checked
+        mock_access_controller.validate_model_access.assert_called_once_with(
+            "project.task", "write"
+        )
+
+        # Verify write was called with all IDs at once (batch operation)
+        mock_connection.write.assert_called_once_with(
+            "project.task", [1, 2, 3], {"display_in_project": True}
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_records_empty_ids_fails(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test that empty record_ids list raises validation error."""
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[],
+                values={"display_in_project": True},
+            )
+
+        assert "No record IDs provided" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_update_records_empty_values_fails(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test that empty values dict raises validation error."""
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[1, 2, 3],
+                values={},
+            )
+
+        assert "No values provided" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_update_records_nonexistent_ids_fails(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test that non-existent record IDs raise error."""
+        # Setup mocks - only 2 of 3 records exist
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.read.return_value = [
+            {"id": 1},
+            {"id": 2},
+        ]  # ID 3 doesn't exist
+
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[1, 2, 3],
+                values={"display_in_project": True},
+            )
+
+        assert "Records not found" in str(exc_info.value)
+        assert "3" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_update_records_access_denied(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test update_records with access denied."""
+        mock_access_controller.validate_model_access.side_effect = AccessControlError(
+            "Access denied"
+        )
+
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[1, 2, 3],
+                values={"display_in_project": True},
+            )
+
+        assert "Access denied" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_update_records_not_authenticated(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test update_records when not authenticated."""
+        mock_connection.is_authenticated = False
+
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[1, 2, 3],
+                values={"display_in_project": True},
+            )
+
+        assert "Not authenticated" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_update_records_connection_error(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Test update_records with connection error during write."""
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.read.return_value = [{"id": 1}, {"id": 2}, {"id": 3}]
+        mock_connection.write.side_effect = OdooConnectionError("Connection lost")
+
+        update_records = mock_app._tools["update_records"]
+
+        with pytest.raises(ValidationError) as exc_info:
+            await update_records(
+                model="project.task",
+                record_ids=[1, 2, 3],
+                values={"display_in_project": True},
+            )
+
+        assert "Connection error" in str(exc_info.value)
+
+
 class TestToolIntegration:
     """Integration tests for tools with real server components."""
 
