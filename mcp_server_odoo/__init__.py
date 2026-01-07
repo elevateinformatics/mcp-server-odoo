@@ -1,6 +1,13 @@
 """MCP Server for Odoo - Model Context Protocol server for Odoo ERP systems."""
 
-__version__ = "0.3.3"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("mcp-server-odoo-ei")
+except PackageNotFoundError:
+    # Package not installed (development mode)
+    __version__ = "0.0.0-dev"
+
 __author__ = "Luciano Bustos"
 __license__ = "MPL-2.0"
 
