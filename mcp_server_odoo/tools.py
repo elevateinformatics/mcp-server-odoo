@@ -454,6 +454,35 @@ class OdooToolHandler:
             return await self._handle_get_record_tool(model, record_id, fields)
 
         @self.app.tool()
+        async def read_records(
+            model: str,
+            record_ids: List[int],
+            fields: Optional[List[str]] = None,
+        ) -> Dict[str, Any]:
+            """Read multiple records by their IDs in a single API call (batch operation).
+
+            This is more efficient than calling get_record multiple times
+            when you need to retrieve specific records by ID.
+
+            Args:
+                model: The Odoo model name (e.g., 'res.partner')
+                record_ids: List of record IDs to read
+                fields: Optional list of fields to return. If None, uses smart defaults.
+                       Use ["__all__"] to get all fields.
+
+            Returns:
+                Dictionary with:
+                - records: List of record data
+                - count: Number of records returned
+                - missing_ids: List of IDs that were not found (if any)
+
+            Example:
+                # Read 50 specific partners in a single call
+                read_records("res.partner", [1, 2, 3, ...], ["name", "email"])
+            """
+            return await self._handle_read_records_tool(model, record_ids, fields)
+
+        @self.app.tool()
         async def list_models() -> Dict[str, List[Dict[str, Any]]]:
             """List all models enabled for MCP access with their allowed operations.
 
@@ -790,6 +819,68 @@ class OdooToolHandler:
             logger.error(f"Error in get_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ToolError(f"Failed to get record: {sanitized_msg}") from e
+
+    async def _handle_read_records_tool(
+        self,
+        model: str,
+        record_ids: List[int],
+        fields: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        """Handle read records (batch) tool request."""
+        try:
+            with perf_logger.track_operation("tool_read_records", model=model):
+                # Check model access
+                self.access_controller.validate_model_access(model, "read")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate input
+                if not record_ids:
+                    raise ValidationError("No record IDs provided for batch read")
+
+                # Determine which fields to fetch
+                fields_to_fetch = fields
+                if fields is None:
+                    # Use smart field selection
+                    fields_to_fetch = self._get_smart_default_fields(model)
+                    logger.debug(
+                        f"Using smart defaults for {model} batch read: "
+                        f"{len(fields_to_fetch) if fields_to_fetch else 'all'} fields"
+                    )
+                elif fields == ["__all__"]:
+                    # Explicit request for all fields
+                    fields_to_fetch = None
+                    logger.debug(f"Fetching all fields for {model} batch read")
+
+                # Read records (single API call)
+                records = self.connection.read(model, record_ids, fields_to_fetch)
+
+                # Process datetime fields in each record
+                records = [self._process_record_dates(record, model) for record in records]
+
+                # Identify missing IDs
+                returned_ids = {record["id"] for record in records}
+                missing_ids = sorted(set(record_ids) - returned_ids)
+
+                return {
+                    "records": records,
+                    "count": len(records),
+                    "missing_ids": missing_ids,
+                    "model": model,
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in read_records tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to read records: {sanitized_msg}") from e
 
     async def _handle_list_models_tool(self) -> Dict[str, Any]:
         """Handle list models tool request with permissions."""
