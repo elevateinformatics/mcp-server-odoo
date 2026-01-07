@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from mcp.server import FastMCP
 
+from . import __version__
 from .access_control import AccessController
 from .config import OdooConfig, get_config
 from .error_handling import (
@@ -24,8 +25,8 @@ from .tools import register_tools
 # Set up logging
 logger = get_logger(__name__)
 
-# Server version
-SERVER_VERSION = "0.1.0"
+# Server version - imported from package metadata
+SERVER_VERSION = __version__
 
 
 class OdooMCPServer:
