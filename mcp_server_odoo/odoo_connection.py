@@ -38,6 +38,22 @@ class OdooConnection:
     # Connection timeout in seconds
     DEFAULT_TIMEOUT = 30
 
+    # Number of retries for connection errors
+    MAX_RETRIES = 2
+
+    # Errors that indicate a stale/dead connection that should trigger reconnection
+    RECONNECTABLE_ERRORS = (
+        "Remote end closed connection without response",
+        "Connection reset by peer",
+        "Connection refused",
+        "Connection timed out",
+        "Broken pipe",
+        "[Errno 104]",  # Connection reset by peer on Linux
+        "[Errno 10054]",  # Connection reset by peer on Windows
+        "[WinError 10054]",  # Connection reset by peer on Windows
+        "EOF occurred in violation of protocol",
+    )
+
     def __init__(
         self,
         config: OdooConfig,
@@ -213,6 +229,64 @@ class OdooConnection:
             logger.debug(f"Server version: {version}")
         except Exception as e:
             raise OdooConnectionError(f"Connection test failed: {e}") from e
+
+    def _refresh_proxies(self) -> None:
+        """Refresh XML-RPC proxies from the connection pool.
+
+        This method obtains fresh proxy connections from the pool,
+        which is useful when the existing connections have become stale
+        due to idle timeout.
+        """
+        logger.debug("Refreshing XML-RPC proxies from connection pool")
+
+        # Get fresh proxies from the pool
+        self._db_proxy = self._performance_manager.get_optimized_connection(self.DB_ENDPOINT)
+        self._common_proxy = self._performance_manager.get_optimized_connection(
+            self.COMMON_ENDPOINT
+        )
+        self._object_proxy = self._performance_manager.get_optimized_connection(
+            self.OBJECT_ENDPOINT
+        )
+
+        logger.debug("XML-RPC proxies refreshed successfully")
+
+    def _is_reconnectable_error(self, error: Exception) -> bool:
+        """Check if an error indicates a stale connection that can be recovered.
+
+        Args:
+            error: The exception to check
+
+        Returns:
+            True if the error indicates a reconnectable connection issue
+        """
+        error_str = str(error)
+        return any(msg in error_str for msg in self.RECONNECTABLE_ERRORS)
+
+    def _reconnect(self) -> bool:
+        """Attempt to reconnect by refreshing proxies.
+
+        This method refreshes the XML-RPC proxies and verifies the
+        connection is working. It does NOT re-authenticate - just
+        refreshes the underlying transport connections.
+
+        Returns:
+            True if reconnection was successful, False otherwise
+        """
+        try:
+            logger.info("Attempting to reconnect to Odoo server...")
+
+            # Refresh proxies from pool
+            self._refresh_proxies()
+
+            # Test the connection
+            self._test_connection()
+
+            logger.info("Successfully reconnected to Odoo server")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Reconnection attempt failed: {e}")
+            return False
 
     def disconnect(self, suppress_logging: bool = False) -> None:
         """Close connection and cleanup resources."""
@@ -811,6 +885,7 @@ class OdooConnection:
         """Execute an operation on an Odoo model with keyword arguments.
 
         This is the main method for interacting with Odoo models via XML-RPC.
+        Implements automatic retry with reconnection for stale connections.
 
         Args:
             model: The Odoo model name (e.g., 'res.partner')
@@ -843,31 +918,69 @@ class OdooConnection:
             kwargs["context"]["lang"] = self.config.locale
             logger.info(f"🌍 Locale injected: {self.config.locale}")
 
-        try:
-            # Log the operation
-            logger.debug(f"Executing {method} on {model} with args={args}, kwargs={kwargs}")
+        last_error: Optional[Exception] = None
 
-            # Execute via object proxy
-            result = self.object_proxy.execute_kw(
-                self._database, self._uid, password_or_token, model, method, args, kwargs
-            )
+        # Retry loop for handling stale connections
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                # Log the operation
+                if attempt == 0:
+                    logger.debug(f"Executing {method} on {model} with args={args}, kwargs={kwargs}")
+                else:
+                    logger.info(f"Retry attempt {attempt} for {method} on {model}")
 
-            logger.debug("Operation completed successfully")
-            return result
+                # Execute via object proxy
+                result = self.object_proxy.execute_kw(
+                    self._database, self._uid, password_or_token, model, method, args, kwargs
+                )
 
-        except xmlrpc.client.Fault as e:
-            logger.error(f"XML-RPC fault during {method} on {model}: {e}")
-            # Sanitize the fault string before exposing to user
-            sanitized_message = ErrorSanitizer.sanitize_xmlrpc_fault(e.faultString)
-            raise OdooConnectionError(f"Operation failed: {sanitized_message}") from e
-        except socket.timeout:
-            logger.error(f"Timeout during {method} on {model}")
-            raise OdooConnectionError(f"Operation timeout after {self.timeout} seconds") from None
-        except Exception as e:
-            logger.error(f"Error during {method} on {model}: {e}")
-            # Sanitize generic errors as well
-            sanitized_message = ErrorSanitizer.sanitize_message(str(e))
-            raise OdooConnectionError(f"Operation failed: {sanitized_message}") from e
+                logger.debug("Operation completed successfully")
+                return result
+
+            except xmlrpc.client.Fault as e:
+                # XML-RPC faults are business logic errors, not connection issues
+                # Don't retry these
+                logger.error(f"XML-RPC fault during {method} on {model}: {e}")
+                sanitized_message = ErrorSanitizer.sanitize_xmlrpc_fault(e.faultString)
+                raise OdooConnectionError(f"Operation failed: {sanitized_message}") from e
+
+            except socket.timeout:
+                # Socket timeouts could be due to slow operations or stale connections
+                last_error = socket.timeout()
+                logger.warning(f"Timeout during {method} on {model} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})")
+
+                # Try to reconnect if we have retries left
+                if attempt < self.MAX_RETRIES:
+                    if self._reconnect():
+                        continue
+                    else:
+                        logger.error("Reconnection failed after timeout")
+
+                raise OdooConnectionError(f"Operation timeout after {self.timeout} seconds") from None
+
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                logger.warning(f"Error during {method} on {model}: {error_str} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})")
+
+                # Check if this is a reconnectable error (stale connection)
+                if self._is_reconnectable_error(e) and attempt < self.MAX_RETRIES:
+                    logger.info(f"Detected stale connection error, attempting reconnection...")
+                    if self._reconnect():
+                        # Reconnection successful, retry the operation
+                        continue
+                    else:
+                        logger.error("Reconnection failed after stale connection error")
+
+                # Not a reconnectable error, or reconnection failed, or no retries left
+                logger.error(f"Error during {method} on {model}: {e}")
+                sanitized_message = ErrorSanitizer.sanitize_message(str(e))
+                raise OdooConnectionError(f"Operation failed: {sanitized_message}") from e
+
+        # Should not reach here, but just in case
+        if last_error:
+            sanitized_message = ErrorSanitizer.sanitize_message(str(last_error))
+            raise OdooConnectionError(f"Operation failed after {self.MAX_RETRIES + 1} attempts: {sanitized_message}")
 
     def search(self, model: str, domain: List[Union[str, List[Any]]], **kwargs) -> List[int]:
         """Search for records matching a domain.

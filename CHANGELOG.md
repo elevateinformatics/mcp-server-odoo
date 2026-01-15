@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-01-15
+
+### Fixed
+
+- **Connection Timeout After Idle**: Fixed issue where the first API call after extended idle period would fail with "Remote end closed connection without response" (#5)
+  - Implemented automatic reconnection with retry logic for stale connections
+  - Added detection of reconnectable connection errors (connection reset, broken pipe, etc.)
+  - Operations now automatically retry up to 2 times with fresh connections
+  - XML-RPC business logic errors are not retried (only connection issues)
+
 ## [0.4.4] - 2026-01-07
 
 ### Added

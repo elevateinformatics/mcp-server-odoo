@@ -692,6 +692,18 @@ This tells Python where to find the system's SSL certificate bundle for HTTPS co
 </details>
 
 <details>
+<summary>Connection Drops After Idle Period</summary>
+
+If you experience connection errors after the server has been idle for a while, this is handled automatically. The server includes automatic reconnection logic that:
+
+- Detects stale connection errors ("Remote end closed connection without response")
+- Automatically refreshes connections and retries failed operations
+- Retries up to 2 times before failing
+
+If you still experience issues, check your network connectivity or firewall settings.
+</details>
+
+<details>
 <summary>Debug Mode</summary>
 
 Enable debug logging for more information:
