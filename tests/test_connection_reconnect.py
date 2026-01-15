@@ -6,7 +6,7 @@ stale connections and automatically reconnects when needed.
 
 import os
 import socket
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -102,7 +102,9 @@ class TestRefreshProxies:
 
         conn._performance_manager = MagicMock()
         conn._performance_manager.get_optimized_connection.side_effect = [
-            mock_proxy1, mock_proxy2, mock_proxy3
+            mock_proxy1,
+            mock_proxy2,
+            mock_proxy3,
         ]
 
         # Call refresh
@@ -198,7 +200,7 @@ class TestExecuteKwRetry:
         mock_proxy = MagicMock()
         mock_proxy.execute_kw.side_effect = [
             Exception("Remote end closed connection without response"),
-            [{"id": 1, "name": "Test"}]
+            [{"id": 1, "name": "Test"}],
         ]
         conn._object_proxy = mock_proxy
 
@@ -224,9 +226,7 @@ class TestExecuteKwRetry:
 
         # Mock object_proxy to raise XML-RPC fault
         mock_proxy = MagicMock()
-        mock_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
-            1, "ValidationError: Invalid field"
-        )
+        mock_proxy.execute_kw.side_effect = xmlrpc.client.Fault(1, "ValidationError: Invalid field")
         conn._object_proxy = mock_proxy
 
         # Mock reconnect
@@ -259,7 +259,7 @@ class TestExecuteKwRetry:
         # Mock reconnect to always succeed
         conn._reconnect = MagicMock(return_value=True)
 
-        with pytest.raises(OdooConnectionError) as exc_info:
+        with pytest.raises(OdooConnectionError):
             conn.execute_kw("res.partner", "search_read", [[]], {})
 
         # Should have tried MAX_RETRIES + 1 times (initial + retries)
@@ -286,7 +286,7 @@ class TestExecuteKwRetry:
         # Mock reconnect to fail
         conn._reconnect = MagicMock(return_value=False)
 
-        with pytest.raises(OdooConnectionError) as exc_info:
+        with pytest.raises(OdooConnectionError):
             conn.execute_kw("res.partner", "search_read", [[]], {})
 
         # Should have called reconnect once (then given up)
@@ -305,10 +305,7 @@ class TestExecuteKwRetry:
 
         # Mock object_proxy to timeout first, succeed second
         mock_proxy = MagicMock()
-        mock_proxy.execute_kw.side_effect = [
-            socket.timeout("Timeout"),
-            [{"id": 1, "name": "Test"}]
-        ]
+        mock_proxy.execute_kw.side_effect = [socket.timeout("Timeout"), [{"id": 1, "name": "Test"}]]
         conn._object_proxy = mock_proxy
 
         # Mock reconnect to succeed

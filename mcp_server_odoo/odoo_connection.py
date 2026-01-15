@@ -947,7 +947,9 @@ class OdooConnection:
             except socket.timeout:
                 # Socket timeouts could be due to slow operations or stale connections
                 last_error = socket.timeout()
-                logger.warning(f"Timeout during {method} on {model} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})")
+                logger.warning(
+                    f"Timeout during {method} on {model} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})"
+                )
 
                 # Try to reconnect if we have retries left
                 if attempt < self.MAX_RETRIES:
@@ -956,16 +958,20 @@ class OdooConnection:
                     else:
                         logger.error("Reconnection failed after timeout")
 
-                raise OdooConnectionError(f"Operation timeout after {self.timeout} seconds") from None
+                raise OdooConnectionError(
+                    f"Operation timeout after {self.timeout} seconds"
+                ) from None
 
             except Exception as e:
                 last_error = e
                 error_str = str(e)
-                logger.warning(f"Error during {method} on {model}: {error_str} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})")
+                logger.warning(
+                    f"Error during {method} on {model}: {error_str} (attempt {attempt + 1}/{self.MAX_RETRIES + 1})"
+                )
 
                 # Check if this is a reconnectable error (stale connection)
                 if self._is_reconnectable_error(e) and attempt < self.MAX_RETRIES:
-                    logger.info(f"Detected stale connection error, attempting reconnection...")
+                    logger.info("Detected stale connection error, attempting reconnection...")
                     if self._reconnect():
                         # Reconnection successful, retry the operation
                         continue
@@ -980,7 +986,9 @@ class OdooConnection:
         # Should not reach here, but just in case
         if last_error:
             sanitized_message = ErrorSanitizer.sanitize_message(str(last_error))
-            raise OdooConnectionError(f"Operation failed after {self.MAX_RETRIES + 1} attempts: {sanitized_message}")
+            raise OdooConnectionError(
+                f"Operation failed after {self.MAX_RETRIES + 1} attempts: {sanitized_message}"
+            )
 
     def search(self, model: str, domain: List[Union[str, List[Any]]], **kwargs) -> List[int]:
         """Search for records matching a domain.

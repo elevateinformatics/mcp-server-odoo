@@ -4,7 +4,10 @@
       "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black:*)",
       "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m black .)",
       "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m ruff check .)",
-      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -q --tb=line)"
+      "Bash(\"c:\\\\Users\\\\luchy\\\\Development\\\\ElevateInformatics\\\\workspace\\\\mcp-server-odoo\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -q --tb=line)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_connection_reconnect.py -v --tb=short)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
