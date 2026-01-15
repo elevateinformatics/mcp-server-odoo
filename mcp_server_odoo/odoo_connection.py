@@ -49,9 +49,12 @@ class OdooConnection:
         "Connection timed out",
         "Broken pipe",
         "[Errno 104]",  # Connection reset by peer on Linux
+        "[Errno 10053]",  # Connection aborted on Windows
         "[Errno 10054]",  # Connection reset by peer on Windows
+        "[WinError 10053]",  # Connection aborted on Windows
         "[WinError 10054]",  # Connection reset by peer on Windows
         "EOF occurred in violation of protocol",
+        "established connection was aborted",
     )
 
     def __init__(

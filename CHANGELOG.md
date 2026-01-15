@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-01-16
+
+### Fixed
+
+- **Connection Aborted Error (Windows)**: Added detection of `[Errno 10053]` "An established connection was aborted by the software" error to reconnectable errors list
+  - This error commonly occurs on Windows when connection is dropped after idle period
+  - Now triggers automatic reconnection with retry logic like other connection errors
+
 ## [0.4.5] - 2026-01-15
 
 ### Fixed

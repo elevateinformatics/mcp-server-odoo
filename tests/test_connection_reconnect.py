@@ -52,6 +52,20 @@ class TestReconnectableErrors:
         for error in errors:
             assert conn._is_reconnectable_error(error) is True, f"Should detect: {error}"
 
+    def test_is_reconnectable_error_connection_aborted(self, test_config):
+        """Test detection of connection aborted errors (Windows)."""
+        conn = OdooConnection(test_config)
+
+        # Test connection aborted error messages
+        errors = [
+            Exception("[Errno 10053] An established connection was aborted by the software"),
+            Exception("[WinError 10053] An established connection was aborted"),
+            Exception("established connection was aborted by the software in your host machine"),
+        ]
+
+        for error in errors:
+            assert conn._is_reconnectable_error(error) is True, f"Should detect: {error}"
+
     def test_is_reconnectable_error_connection_refused(self, test_config):
         """Test detection of connection refused error."""
         conn = OdooConnection(test_config)
