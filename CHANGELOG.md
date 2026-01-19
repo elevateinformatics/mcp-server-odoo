@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-01-19
+
+### Fixed
+
+- **list_models Validation Error**: Fixed Pydantic type mismatch in `list_models` tool return type (#6)
+  - Return type was `Dict[str, List[Dict[str, Any]]]` but YOLO mode returns `yolo_mode` (dict) and `total` (int)
+  - Changed return type to `Dict[str, Any]` to correctly represent the actual response structure
+  - Affects both YOLO read and YOLO full modes
+
 ## [0.4.6] - 2026-01-16
 
 ### Fixed
