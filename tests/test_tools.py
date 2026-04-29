@@ -742,10 +742,15 @@ class TestOdooToolHandler:
         assert "Getting" in first_msg
 
     @pytest.mark.asyncio
-    async def test_list_models_calls_context_info_and_progress(
+    async def test_list_models_calls_context_info(
         self, handler, mock_connection, mock_access_controller, mock_app
     ):
-        """Test that list_models sends context info and progress."""
+        """Test that list_models sends context info messages.
+
+        Per docs/issues/progress-token-disconnects.md, list_models no longer emits
+        per-iteration progress notifications — it now emits a single info before
+        the enrichment loop instead.
+        """
         from unittest.mock import AsyncMock
 
         from mcp_server_odoo.access_control import ModelPermissions
@@ -769,7 +774,8 @@ class TestOdooToolHandler:
         ctx.info.assert_called()
         first_msg = ctx.info.call_args_list[0][0][0]
         assert "Listing" in first_msg
-        ctx.report_progress.assert_called()
+        info_messages = [call.args[0] for call in ctx.info.call_args_list]
+        assert any("Enriching" in msg for msg in info_messages)
 
     @pytest.mark.asyncio
     async def test_create_record_calls_context_info(
@@ -818,6 +824,19 @@ class TestOdooToolHandler:
         fields_arg = call_args[0][2]  # Third positional argument is fields
         assert fields_arg is None, "Expected fields=None when __all__ is requested"
 
+    @staticmethod
+    def _assert_no_terminal_progress(ctx):
+        """Assert no progress notification has progress == total.
+
+        See docs/issues/progress-token-disconnects.md.
+        """
+        for call in ctx.report_progress.call_args_list:
+            progress, total = call.args[0], call.args[1]
+            assert progress != total, (
+                f"Terminal progress notification ({progress}/{total}) - "
+                "see docs/issues/progress-token-disconnects.md"
+            )
+
     @pytest.mark.asyncio
     async def test_context_error_does_not_crash_tool(
         self, handler, mock_connection, mock_access_controller, mock_app
@@ -830,7 +849,9 @@ class TestOdooToolHandler:
         mock_connection.search.return_value = [1]
         mock_connection.read.return_value = [{"id": 1, "name": "Test"}]
 
-        # Create a context that raises on every call
+        # Create a context that raises on every call. The report_progress
+        # side_effect still exercises the surviving intermediate _ctx_progress
+        # call in search_records (the "Found N records" 1/3 update).
         ctx = AsyncMock()
         ctx.info.side_effect = RuntimeError("transport broken")
         ctx.report_progress.side_effect = RuntimeError("transport broken")
@@ -840,6 +861,67 @@ class TestOdooToolHandler:
         result = await search_records(model="res.partner", fields=["name"], limit=10, ctx=ctx)
         assert result.total == 1
         assert len(result.records) == 1
+        # Confirm the surviving non-terminal progress call was attempted (and
+        # its RuntimeError was swallowed by _ctx_progress' except branch).
+        ctx.report_progress.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_search_records_emits_no_terminal_progress(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Regression: terminal progress notifications cause stdio client disconnects.
+
+        See docs/issues/progress-token-disconnects.md.
+        """
+        from unittest.mock import AsyncMock
+
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.search_count.return_value = 5
+        mock_connection.search.return_value = [1, 2, 3]
+        mock_connection.read.return_value = [{"id": i, "name": f"R{i}"} for i in (1, 2, 3)]
+
+        ctx = AsyncMock()
+        search_records = mock_app._tools["search_records"]
+        await search_records(model="res.partner", domain=[], fields=None, limit=10, ctx=ctx)
+
+        self._assert_no_terminal_progress(ctx)
+
+    @pytest.mark.asyncio
+    async def test_list_models_emits_no_terminal_progress(
+        self, handler, mock_access_controller, mock_app, valid_config
+    ):
+        """Regression: list_models emitted terminal progress on the last loop iter.
+
+        See docs/issues/progress-token-disconnects.md.
+        """
+        from unittest.mock import AsyncMock
+
+        from mcp_server_odoo.access_control import ModelPermissions
+
+        # Force standard-mode branch (not YOLO) so the standard list_models
+        # path is exercised — that's where the regression originally lived.
+        # valid_config is a function-scoped fixture, so this mutation does
+        # not leak.
+        valid_config.yolo_mode = "off"
+
+        mock_access_controller.get_enabled_models.return_value = [
+            {"model": "res.partner", "name": "Partner"},
+            {"model": "res.users", "name": "User"},
+        ]
+        mock_access_controller.get_model_permissions.return_value = ModelPermissions(
+            model="res.partner",
+            enabled=True,
+            can_read=True,
+            can_write=False,
+            can_create=False,
+            can_unlink=False,
+        )
+
+        ctx = AsyncMock()
+        list_models = mock_app._tools["list_models"]
+        await list_models(ctx=ctx)
+
+        self._assert_no_terminal_progress(ctx)
 
 
 class TestYoloListModels:

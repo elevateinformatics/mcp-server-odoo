@@ -684,7 +684,7 @@ class OdooToolHandler:
                     records = self.connection.read(model, record_ids, fields_to_fetch)
                     # Process datetime fields in each record
                     records = [self._process_record_dates(record, model) for record in records]
-                await self._ctx_progress(ctx, 3, 3, f"Returning {len(records)} records")
+                await self._ctx_info(ctx, f"Returning {len(records)} records")
 
                 return {
                     "records": records,
@@ -892,9 +892,10 @@ class OdooToolHandler:
                 models = self.access_controller.get_enabled_models()
 
                 # Enrich with permissions for each model
+                if models:
+                    await self._ctx_info(ctx, f"Enriching {len(models)} models...")
                 enriched_models = []
-                for i, model_info in enumerate(models):
-                    await self._ctx_progress(ctx, i + 1, len(models))
+                for model_info in models:
                     model_name = model_info["model"]
                     try:
                         # Get permissions for this model
