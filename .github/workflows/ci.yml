@@ -131,7 +131,7 @@ jobs:
         docker run -d --name odoo --network "${{ job.services.postgres.network }}" \
           -e HOST=postgres -e USER=odoo -e PASSWORD=odoo \
           -p 8069:8069 \
-          odoo:18 -- --database test --init base --without-demo all
+          odoo:18 -- --database test --init base,mail --without-demo all
 
         # Wait for Odoo to finish initializing
         echo "Waiting for Odoo to initialize database..."

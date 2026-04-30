@@ -586,6 +586,27 @@ Delete a record from Odoo.
 }
 ```
 
+### `post_message`
+Post a message to a record's chatter (`mail.thread`). `subtype="note"` (default) is an internal log; `subtype="comment"` notifies followers. Set `body_is_html=true` for HTML markup. Optional `partner_ids` and `attachment_ids` reference existing partners and attachments.
+
+```json
+{
+  "model": "res.partner",
+  "record_id": 42,
+  "body": "Called customer, will follow up Tuesday"
+}
+```
+
+```json
+{
+  "model": "sale.order",
+  "record_id": 17,
+  "body": "<p>Shipping confirmed for Monday</p>",
+  "subtype": "comment",
+  "body_is_html": true
+}
+```
+
 ### Smart Field Selection
 
 When you omit the `fields` parameter (or set it to `null`), the server automatically selects the most relevant fields for each model using a scoring algorithm:

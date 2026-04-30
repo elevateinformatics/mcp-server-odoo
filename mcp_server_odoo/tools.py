@@ -7,7 +7,7 @@ actions like creating, updating, or deleting records.
 
 import json
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -26,6 +26,7 @@ from .schemas import (
     DeleteResult,
     FieldSelectionMetadata,
     ModelsResult,
+    PostMessageResult,
     RecordResult,
     ResourceTemplatesResult,
     SearchResult,
@@ -559,6 +560,58 @@ class OdooToolHandler:
             result = await self._handle_delete_record_tool(model, record_id, ctx)
             return DeleteResult(**result)
 
+        @self.app.tool(
+            title="Post Message",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def post_message(
+            model: str,
+            record_id: int,
+            body: str,
+            subtype: Literal["note", "comment"] = "note",
+            message_type: Literal["comment", "notification"] = "comment",
+            partner_ids: Optional[List[int]] = None,
+            attachment_ids: Optional[List[int]] = None,
+            body_is_html: bool = False,
+            ctx: Optional[Context] = None,
+        ) -> PostMessageResult:
+            """Post a message to an Odoo record's chatter (mail.thread).
+
+            ``subtype="note"`` (default) is an internal log; ``subtype="comment"``
+            notifies followers. Set ``body_is_html=True`` for HTML markup
+            (Odoo 17+ escapes str bodies otherwise).
+
+            Args:
+                model: Odoo model name (e.g., 'res.partner')
+                record_id: Record ID to post to
+                body: Message body (plain text by default; HTML if body_is_html=True)
+                subtype: 'note' (internal, default) or 'comment' (notifies followers)
+                message_type: 'comment' (default) or 'notification'
+                partner_ids: Optional list of res.partner IDs to additionally notify
+                attachment_ids: Optional list of existing ir.attachment IDs to link
+                body_is_html: Treat body as HTML rather than plain text (Odoo 17+)
+
+            Returns:
+                Confirmation with the new mail.message ID.
+            """
+            result = await self._handle_post_message_tool(
+                model,
+                record_id,
+                body,
+                subtype,
+                message_type,
+                partner_ids,
+                attachment_ids,
+                body_is_html,
+                ctx,
+            )
+            return PostMessageResult(**result)
+
     async def _handle_search_tool(
         self,
         model: str,
@@ -684,7 +737,7 @@ class OdooToolHandler:
                     records = self.connection.read(model, record_ids, fields_to_fetch)
                     # Process datetime fields in each record
                     records = [self._process_record_dates(record, model) for record in records]
-                await self._ctx_progress(ctx, 3, 3, f"Returning {len(records)} records")
+                await self._ctx_info(ctx, f"Returning {len(records)} records")
 
                 return {
                     "records": records,
@@ -892,9 +945,10 @@ class OdooToolHandler:
                 models = self.access_controller.get_enabled_models()
 
                 # Enrich with permissions for each model
+                if models:
+                    await self._ctx_info(ctx, f"Enriching {len(models)} models...")
                 enriched_models = []
-                for i, model_info in enumerate(models):
-                    await self._ctx_progress(ctx, i + 1, len(models))
+                for model_info in models:
                     model_name = model_info["model"]
                     try:
                         # Get permissions for this model
@@ -1165,6 +1219,95 @@ class OdooToolHandler:
             logger.error(f"Error in delete_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ValidationError(f"Failed to delete record: {sanitized_msg}") from e
+
+    async def _handle_post_message_tool(
+        self,
+        model: str,
+        record_id: int,
+        body: str,
+        subtype: str,
+        message_type: str,
+        partner_ids: Optional[List[int]],
+        attachment_ids: Optional[List[int]],
+        body_is_html: bool,
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle post message tool request."""
+        subtype_xmlid_map = {
+            "note": "mail.mt_note",
+            "comment": "mail.mt_comment",
+        }
+        try:
+            with perf_logger.track_operation("tool_post_message", model=model):
+                # Check model access — message_post mutates the record
+                self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Posting message to {model}/{record_id}...")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate body before any XML-RPC call
+                if not body or not body.strip():
+                    raise ValidationError("body must not be empty")
+
+                # Build kwargs — omit partner_ids/attachment_ids when None
+                # (empty list means "clear all" in some Odoo contexts)
+                kwargs: Dict[str, Any] = {
+                    "body": body,
+                    "message_type": message_type,
+                    "subtype_xmlid": subtype_xmlid_map[subtype],
+                }
+                if partner_ids is not None:
+                    kwargs["partner_ids"] = partner_ids
+                if attachment_ids is not None:
+                    kwargs["attachment_ids"] = attachment_ids
+                if body_is_html:
+                    # Odoo 19 escapes any plain str body — opt-in flag preserves HTML
+                    kwargs["body_is_html"] = True
+
+                # Call message_post; translate the "no mail.thread" error before
+                # the outer ladder turns it into a generic "Connection error".
+                try:
+                    raw = self.connection.execute_kw(model, "message_post", [record_id], kwargs)
+                except OdooConnectionError as e:
+                    err_msg = str(e)
+                    if "message_post" in err_msg and (
+                        "has no attribute" in err_msg
+                        or "AttributeError" in err_msg
+                        or "does not exist" in err_msg
+                    ):
+                        raise ValidationError(
+                            f"Model '{model}' does not support chatter "
+                            "(no mail.thread inheritance)."
+                        ) from e
+                    raise
+
+                # Coerce return value to int message_id
+                if isinstance(raw, bool) or raw is None:
+                    raise ValidationError(f"Unexpected return from message_post: {raw!r}")
+                if isinstance(raw, int):
+                    message_id = raw
+                elif isinstance(raw, list) and raw and isinstance(raw[0], int):
+                    message_id = raw[0]
+                else:
+                    raise ValidationError(f"Unexpected return from message_post: {raw!r}")
+
+                return {
+                    "success": True,
+                    "message_id": message_id,
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in post_message tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to post message: {sanitized_msg}") from e
 
 
 def register_tools(
