@@ -82,6 +82,7 @@ class TestOdooToolHandler:
             "create_record",
             "update_record",
             "delete_record",
+            "post_message",
             "list_resource_templates",
         }
         assert set(mock_app._tools.keys()) == expected_tools
@@ -1342,6 +1343,223 @@ class TestDeleteRecordTool:
         delete_record = mock_app._tools["delete_record"]
         with pytest.raises(ValidationError, match="Connection error"):
             await delete_record(model="res.partner", record_id=1)
+
+
+class TestPostMessageTool:
+    """Test cases for post_message tool."""
+
+    @pytest.fixture
+    def mock_app(self):
+        app = MagicMock(spec=FastMCP)
+        app._tools = {}
+
+        def tool_decorator(**kwargs):
+            def decorator(func):
+                app._tools[func.__name__] = func
+                return func
+
+            return decorator
+
+        app.tool = tool_decorator
+        return app
+
+    @pytest.fixture
+    def mock_connection(self):
+        connection = MagicMock(spec=OdooConnection)
+        connection.is_authenticated = True
+        return connection
+
+    @pytest.fixture
+    def mock_access_controller(self):
+        return MagicMock(spec=AccessController)
+
+    @pytest.fixture
+    def valid_config(self):
+        return OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            database="test_db",
+        )
+
+    @pytest.fixture
+    def handler(self, mock_app, mock_connection, mock_access_controller, valid_config):
+        return OdooToolHandler(mock_app, mock_connection, mock_access_controller, valid_config)
+
+    @pytest.mark.asyncio
+    async def test_post_message_success_default_note(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Happy path: defaults map to mail.mt_note and write permission is checked."""
+        mock_connection.execute_kw.return_value = 42
+
+        post_message = mock_app._tools["post_message"]
+        result = await post_message(
+            model="res.partner",
+            record_id=7,
+            body="Called customer, will follow up",
+        )
+
+        assert result.success is True
+        assert result.message_id == 42
+
+        mock_access_controller.validate_model_access.assert_called_once_with("res.partner", "write")
+        mock_connection.execute_kw.assert_called_once()
+        args, kwargs = mock_connection.execute_kw.call_args
+        # positional args: model, method, args_list, kwargs_dict
+        assert args[0] == "res.partner"
+        assert args[1] == "message_post"
+        assert args[2] == [7]
+        sent_kwargs = args[3]
+        assert sent_kwargs["body"] == "Called customer, will follow up"
+        assert sent_kwargs["message_type"] == "comment"
+        assert sent_kwargs["subtype_xmlid"] == "mail.mt_note"
+        # partner_ids / attachment_ids omitted when None
+        assert "partner_ids" not in sent_kwargs
+        assert "attachment_ids" not in sent_kwargs
+        # body_is_html omitted when False (Odoo's default)
+        assert "body_is_html" not in sent_kwargs
+
+    @pytest.mark.asyncio
+    async def test_post_message_subtype_comment_maps_to_mt_comment(
+        self, handler, mock_connection, mock_app
+    ):
+        """subtype='comment' must map to mail.mt_comment."""
+        mock_connection.execute_kw.return_value = 99
+
+        post_message = mock_app._tools["post_message"]
+        await post_message(
+            model="sale.order", record_id=17, body="Shipping Monday", subtype="comment"
+        )
+
+        sent_kwargs = mock_connection.execute_kw.call_args[0][3]
+        assert sent_kwargs["subtype_xmlid"] == "mail.mt_comment"
+
+    @pytest.mark.asyncio
+    async def test_post_message_empty_body_rejected(self, handler, mock_connection, mock_app):
+        """Empty body raises ValidationError before any XML-RPC call."""
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="body must not be empty"):
+            await post_message(model="res.partner", record_id=1, body="")
+        mock_connection.execute_kw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_message_whitespace_body_rejected(self, handler, mock_connection, mock_app):
+        """Whitespace-only body raises ValidationError before any XML-RPC call."""
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="body must not be empty"):
+            await post_message(model="res.partner", record_id=1, body="   \n\t ")
+        mock_connection.execute_kw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_post_message_body_is_html_forwarded(self, handler, mock_connection, mock_app):
+        """body_is_html=True forwards the kwarg so Odoo preserves HTML markup."""
+        mock_connection.execute_kw.return_value = 1
+
+        post_message = mock_app._tools["post_message"]
+        await post_message(
+            model="res.partner",
+            record_id=1,
+            body="<p>Bold <b>text</b></p>",
+            body_is_html=True,
+        )
+
+        sent_kwargs = mock_connection.execute_kw.call_args[0][3]
+        assert sent_kwargs["body_is_html"] is True
+
+    @pytest.mark.asyncio
+    async def test_post_message_partner_and_attachment_ids_passed_through(
+        self, handler, mock_connection, mock_app
+    ):
+        """When provided, partner_ids and attachment_ids appear in kwargs."""
+        mock_connection.execute_kw.return_value = 1
+
+        post_message = mock_app._tools["post_message"]
+        await post_message(
+            model="res.partner",
+            record_id=1,
+            body="Hi",
+            partner_ids=[5, 6],
+            attachment_ids=[10],
+        )
+
+        sent_kwargs = mock_connection.execute_kw.call_args[0][3]
+        assert sent_kwargs["partner_ids"] == [5, 6]
+        assert sent_kwargs["attachment_ids"] == [10]
+
+    @pytest.mark.asyncio
+    async def test_post_message_no_mail_thread_has_no_attribute_branch(
+        self, handler, mock_connection, mock_app
+    ):
+        """'has no attribute' fault → ValidationError mentioning mail.thread."""
+        mock_connection.execute_kw.side_effect = OdooConnectionError(
+            "'res.country' object has no attribute 'message_post'"
+        )
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="mail.thread"):
+            await post_message(model="res.country", record_id=1, body="hi")
+
+    @pytest.mark.asyncio
+    async def test_post_message_no_mail_thread_attribute_error_branch(
+        self, handler, mock_connection, mock_app
+    ):
+        """XML-RPC fault wrapping AttributeError → ValidationError mentioning mail.thread."""
+        mock_connection.execute_kw.side_effect = OdooConnectionError(
+            "XML-RPC fault: AttributeError on res.country: message_post not found"
+        )
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="mail.thread"):
+            await post_message(model="res.country", record_id=1, body="hi")
+
+    @pytest.mark.asyncio
+    async def test_post_message_no_mail_thread_method_does_not_exist_branch(
+        self, handler, mock_connection, mock_app
+    ):
+        """Odoo 19 wording 'method ... does not exist' → ValidationError mentioning mail.thread."""
+        mock_connection.execute_kw.side_effect = OdooConnectionError(
+            "Operation failed: Internal Server Error in The method 'res.country.message_post' does not exist"
+        )
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="mail.thread"):
+            await post_message(model="res.country", record_id=1, body="hi")
+
+    @pytest.mark.asyncio
+    async def test_post_message_access_denied(
+        self, handler, mock_connection, mock_access_controller, mock_app
+    ):
+        """Access denial against 'write' permission surfaces as ValidationError."""
+        mock_access_controller.validate_model_access.side_effect = AccessControlError("no write")
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="Access denied"):
+            await post_message(model="res.partner", record_id=1, body="hi")
+        mock_access_controller.validate_model_access.assert_called_once_with("res.partner", "write")
+
+    @pytest.mark.asyncio
+    async def test_post_message_return_value_list_coerced(self, handler, mock_connection, mock_app):
+        """execute_kw returning [42] is coerced to message_id=42."""
+        mock_connection.execute_kw.return_value = [42]
+        post_message = mock_app._tools["post_message"]
+        result = await post_message(model="res.partner", record_id=1, body="hi")
+        assert result.message_id == 42
+
+    @pytest.mark.asyncio
+    async def test_post_message_return_value_false_rejected(
+        self, handler, mock_connection, mock_app
+    ):
+        """execute_kw returning False raises ValidationError."""
+        mock_connection.execute_kw.return_value = False
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="Unexpected return"):
+            await post_message(model="res.partner", record_id=1, body="hi")
+
+    @pytest.mark.asyncio
+    async def test_post_message_return_value_dict_rejected(
+        self, handler, mock_connection, mock_app
+    ):
+        """execute_kw returning a non-int/non-list-of-int raises ValidationError."""
+        mock_connection.execute_kw.return_value = {}
+        post_message = mock_app._tools["post_message"]
+        with pytest.raises(ValidationError, match="Unexpected return"):
+            await post_message(model="res.partner", record_id=1, body="hi")
 
 
 class TestListModelsTool:

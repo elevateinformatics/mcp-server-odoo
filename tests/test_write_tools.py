@@ -406,3 +406,403 @@ class TestWriteToolsIntegration:
             except Exception:
                 pass
             raise
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_note_to_partner(self, real_tool_handler):
+        """Posting a note to res.partner creates a mail.message linked to the record."""
+        handler = real_tool_handler
+
+        # Use main_partner (always present) — we'll clean up the message afterwards
+        partner_ids = handler.connection.search("res.partner", [], limit=1)
+        assert partner_ids, "Need at least one res.partner for this test"
+        partner_id = partner_ids[0]
+
+        # Body contains '<' so we can verify Odoo 19's plain-str escape behavior
+        # (Odoo wraps any '<' in str body to '&lt;' when body_is_html is False).
+        body = "MCP integration test: 5 < 10 & still works"
+        result = await handler._handle_post_message_tool(
+            "res.partner",
+            partner_id,
+            body,
+            "note",
+            "comment",
+            None,
+            None,
+            False,
+        )
+
+        message_id = result["message_id"]
+        assert result["success"] is True
+        assert isinstance(message_id, int) and message_id > 0
+
+        try:
+            # Verify the message exists, is linked correctly, AND that the angle
+            # bracket got escaped — confirming body_is_html=False is honored.
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["model", "res_id", "body", "subtype_id"],
+            )
+            assert len(messages) == 1
+            msg = messages[0]
+            assert msg["model"] == "res.partner"
+            assert msg["res_id"] == partner_id
+            stored_body = msg["body"]
+            # Plain-str path must escape '<' to '&lt;' (positive assertion catches
+            # both "literal < survived" and "substring stripped entirely" failures).
+            assert "5 &lt; 10" in stored_body, (
+                f"Expected '<' to be escaped to '&lt;', got: {stored_body!r}"
+            )
+            assert "5 < 10" not in stored_body, (
+                f"Plain-str body should be escaped, but stored as: {stored_body!r}"
+            )
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_comment_subtype_resolves_to_mt_comment(self, real_tool_handler):
+        """subtype='comment' yields a message whose subtype xmlid is mail.mt_comment."""
+        handler = real_tool_handler
+
+        partner_ids = handler.connection.search("res.partner", [], limit=1)
+        partner_id = partner_ids[0]
+
+        result = await handler._handle_post_message_tool(
+            "res.partner",
+            partner_id,
+            "MCP integration test: comment subtype",
+            "comment",
+            "comment",
+            None,
+            None,
+            False,
+        )
+        message_id = result["message_id"]
+
+        try:
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["subtype_id"],
+            )
+            assert len(messages) == 1
+            subtype_field = messages[0]["subtype_id"]
+            # Many2one comes back as [id, name] or False
+            assert subtype_field, "Expected a subtype to be set"
+            subtype_id = subtype_field[0] if isinstance(subtype_field, list) else subtype_field
+
+            # Resolve xmlid via ir.model.data
+            xml_records = handler.connection.search_read(
+                "ir.model.data",
+                [
+                    ("model", "=", "mail.message.subtype"),
+                    ("res_id", "=", subtype_id),
+                ],
+                ["module", "name"],
+            )
+            assert any(
+                r.get("module") == "mail" and r.get("name") == "mt_comment" for r in xml_records
+            ), f"Expected mail.mt_comment subtype, got {xml_records}"
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_non_mail_thread_model_rejected(self, real_tool_handler):
+        """Posting against a model without mail.thread raises ValidationError mentioning mail.thread."""
+        from mcp_server_odoo.error_handling import ValidationError
+
+        handler = real_tool_handler
+
+        # res.country has no mail.thread — pick any country id (always populated)
+        country_ids = handler.connection.search("res.country", [], limit=1)
+        assert country_ids, "Need at least one res.country for this test"
+
+        with pytest.raises(ValidationError, match="mail.thread"):
+            await handler._handle_post_message_tool(
+                "res.country",
+                country_ids[0],
+                "should fail",
+                "note",
+                "comment",
+                None,
+                None,
+                False,
+            )
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_body_is_html_preserves_markup(self, real_tool_handler):
+        """body_is_html=True forwards the kwarg so Odoo stores HTML markup unescaped."""
+        handler = real_tool_handler
+
+        partner_ids = handler.connection.search("res.partner", [], limit=1)
+        partner_id = partner_ids[0]
+
+        body = "<p><b>bold</b> and <i>italic</i></p>"
+        result = await handler._handle_post_message_tool(
+            "res.partner",
+            partner_id,
+            body,
+            "note",
+            "comment",
+            None,
+            None,
+            True,  # body_is_html
+        )
+        message_id = result["message_id"]
+
+        try:
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["body"],
+            )
+            stored_body = messages[0]["body"]
+            # With body_is_html=True the literal HTML tags survive — neither
+            # '<p>' nor '<b>' should be encoded to '&lt;p&gt;' / '&lt;b&gt;'
+            assert "<p>" in stored_body, f"Expected literal <p>, got: {stored_body!r}"
+            assert "<b>bold</b>" in stored_body, (
+                f"Expected literal <b>bold</b>, got: {stored_body!r}"
+            )
+            assert "&lt;p&gt;" not in stored_body, (
+                f"HTML markup was double-escaped: {stored_body!r}"
+            )
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_post_message_partner_ids_added_as_recipients(self, real_tool_handler):
+        """partner_ids forwards to message_post and lands on mail.message.partner_ids."""
+        handler = real_tool_handler
+
+        # Need at least two partners — one to post to, one to notify
+        partner_ids = handler.connection.search("res.partner", [], limit=2)
+        if len(partner_ids) < 2:
+            pytest.skip("Need at least two res.partner records for this test")
+        target_id, recipient_id = partner_ids[0], partner_ids[1]
+
+        result = await handler._handle_post_message_tool(
+            "res.partner",
+            target_id,
+            "MCP integration test: notify recipient",
+            "comment",
+            "comment",
+            [recipient_id],
+            None,
+            False,
+        )
+        message_id = result["message_id"]
+
+        try:
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["partner_ids"],
+            )
+            recipients = messages[0]["partner_ids"]  # list of ids
+            assert recipient_id in recipients, (
+                f"Expected partner {recipient_id} in recipients, got {recipients}"
+            )
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
+
+class TestPostMessageMCPIntegration:
+    """MCP-mode integration tests for post_message — exercises the standard MCP module endpoints."""
+
+    @pytest.fixture
+    def mcp_config(self):
+        """Standard-mode config (no YOLO) — relies on .env / environment."""
+        from mcp_server_odoo.config import get_config
+
+        return get_config()
+
+    @pytest.fixture
+    def mcp_connection(self, mcp_config):
+        from mcp_server_odoo.odoo_connection import OdooConnection
+
+        conn = OdooConnection(mcp_config)
+        conn.connect()
+        conn.authenticate()
+        yield conn
+        conn.disconnect()
+
+    @pytest.fixture
+    def mcp_access_controller(self, mcp_config):
+        from mcp_server_odoo.access_control import AccessController
+
+        return AccessController(mcp_config)
+
+    @pytest.fixture
+    def mcp_app(self):
+        from mcp.server.fastmcp import FastMCP
+
+        return FastMCP("test-app-mcp")
+
+    @pytest.fixture
+    def mcp_tool_handler(self, mcp_app, mcp_connection, mcp_access_controller, mcp_config):
+        return register_tools(mcp_app, mcp_connection, mcp_access_controller, mcp_config)
+
+    @pytest.mark.mcp
+    @pytest.mark.asyncio
+    async def test_post_message_mcp_happy_path(self, mcp_tool_handler, writable_model):
+        """Posting a note via MCP endpoints succeeds on a writable model."""
+        handler = mcp_tool_handler
+        model = writable_model.model
+
+        record_ids = handler.connection.search(model, [], limit=1)
+        if not record_ids:
+            pytest.skip(f"No records of {model} available for post_message test")
+
+        # If the writable model lacks mail.thread, skip — the MCP write gate is
+        # the focus here, not chatter coverage (covered by unit + YOLO tests).
+        result = None
+        try:
+            result = await handler._handle_post_message_tool(
+                model,
+                record_ids[0],
+                "MCP integration test: standard-mode note",
+                "note",
+                "comment",
+                None,
+                None,
+                False,
+            )
+        except ValidationError as e:
+            if "mail.thread" in str(e):
+                pytest.skip(f"Writable model {model} has no mail.thread — skipping")
+            raise
+
+        assert result["success"] is True
+        message_id = result["message_id"]
+        assert isinstance(message_id, int) and message_id > 0
+
+        # Verification reads mail.message, which not every MCP deployment exposes.
+        # If it isn't enabled, treat the round-trip success as sufficient.
+        try:
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["model", "res_id"],
+            )
+        except OdooConnectionError as e:
+            if "Permission denied" in str(e) or "Access denied" in str(e):
+                return  # mail.message not exposed via MCP — post itself succeeded
+            raise
+
+        try:
+            assert len(messages) == 1
+            assert messages[0]["model"] == model
+            assert messages[0]["res_id"] == record_ids[0]
+        finally:
+            try:
+                handler.connection.unlink("mail.message", [message_id])
+            except Exception:
+                pass
+
+    @pytest.mark.mcp
+    @pytest.mark.asyncio
+    async def test_post_message_mcp_comment_subtype(self, mcp_tool_handler, writable_model):
+        """subtype='comment' yields mail.mt_comment via MCP endpoints."""
+        handler = mcp_tool_handler
+        model = writable_model.model
+
+        record_ids = handler.connection.search(model, [], limit=1)
+        if not record_ids:
+            pytest.skip(f"No records of {model} available for post_message test")
+
+        message_id = None
+        try:
+            result = await handler._handle_post_message_tool(
+                model,
+                record_ids[0],
+                "MCP integration test: standard-mode comment",
+                "comment",
+                "comment",
+                None,
+                None,
+                False,
+            )
+            message_id = result["message_id"]
+        except ValidationError as e:
+            err = str(e)
+            if "mail.thread" in err:
+                pytest.skip(f"Writable model {model} has no mail.thread — skipping")
+            if "rate limit" in err.lower():
+                pytest.skip("MCP rate limiter fired under test load — non-deterministic")
+            raise
+
+        # Verification reads mail.message and ir.model.data, neither of which
+        # every MCP deployment exposes. Skip gracefully when they aren't.
+        try:
+            messages = handler.connection.search_read(
+                "mail.message",
+                [("id", "=", message_id)],
+                ["subtype_id"],
+            )
+        except OdooConnectionError as e:
+            if "Permission denied" in str(e) or "Access denied" in str(e):
+                return  # mail.message not exposed via MCP — post itself succeeded
+            raise
+
+        try:
+            subtype_field = messages[0]["subtype_id"]
+            assert subtype_field, "Expected a subtype to be set"
+            subtype_id = subtype_field[0] if isinstance(subtype_field, list) else subtype_field
+
+            try:
+                xml_records = handler.connection.search_read(
+                    "ir.model.data",
+                    [
+                        ("model", "=", "mail.message.subtype"),
+                        ("res_id", "=", subtype_id),
+                    ],
+                    ["module", "name"],
+                )
+            except OdooConnectionError as e:
+                if "Permission denied" in str(e) or "Access denied" in str(e):
+                    return  # ir.model.data not exposed — leave subtype_id-level assertion only
+                raise
+
+            assert any(
+                r.get("module") == "mail" and r.get("name") == "mt_comment" for r in xml_records
+            ), f"Expected mail.mt_comment subtype, got {xml_records}"
+        finally:
+            if message_id:
+                try:
+                    handler.connection.unlink("mail.message", [message_id])
+                except Exception:
+                    pass
+
+    @pytest.mark.mcp
+    @pytest.mark.asyncio
+    async def test_post_message_mcp_disabled_model_denied(self, mcp_tool_handler, disabled_model):
+        """Posting to a model not enabled in MCP module → ValidationError 'Access denied'."""
+        handler = mcp_tool_handler
+        with pytest.raises(ValidationError, match="Access denied"):
+            await handler._handle_post_message_tool(
+                disabled_model,
+                1,
+                "should be denied",
+                "note",
+                "comment",
+                None,
+                None,
+                False,
+            )

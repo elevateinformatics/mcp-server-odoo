@@ -156,3 +156,13 @@ class DeleteResult(BaseModel):
     deleted_id: int = Field(description="ID of the deleted record")
     deleted_name: str = Field(description="Display name of the deleted record")
     message: str = Field(description="Human-readable success message")
+
+
+# --- Post Message ---
+
+
+class PostMessageResult(BaseModel):
+    """Result of posting a message to a record's chatter."""
+
+    success: bool = Field(description="Whether the message was posted successfully")
+    message_id: int = Field(description="ID of the created mail.message record")
