@@ -749,9 +749,10 @@ class TestOdooToolHandler:
     ):
         """Test that list_models sends context info messages.
 
-        Per docs/issues/progress-token-disconnects.md, list_models no longer emits
-        per-iteration progress notifications — it now emits a single info before
-        the enrichment loop instead.
+        list_models no longer emits per-iteration progress notifications — it now
+        emits a single info before the enrichment loop instead. (Terminal progress
+        notifications can be flushed after the response under stdio transport,
+        which strict MCP clients treat as a protocol violation.)
         """
         from unittest.mock import AsyncMock
 
@@ -830,13 +831,14 @@ class TestOdooToolHandler:
     def _assert_no_terminal_progress(ctx):
         """Assert no progress notification has progress == total.
 
-        See docs/issues/progress-token-disconnects.md.
+        Terminal progress under stdio can flush after the response, which strict
+        MCP clients treat as a protocol violation.
         """
         for call in ctx.report_progress.call_args_list:
             progress, total = call.args[0], call.args[1]
             assert progress != total, (
                 f"Terminal progress notification ({progress}/{total}) - "
-                "see docs/issues/progress-token-disconnects.md"
+                "stdio clients reject post-response notifications"
             )
 
     @pytest.mark.asyncio
@@ -871,10 +873,7 @@ class TestOdooToolHandler:
     async def test_search_records_emits_no_terminal_progress(
         self, handler, mock_connection, mock_access_controller, mock_app
     ):
-        """Regression: terminal progress notifications cause stdio client disconnects.
-
-        See docs/issues/progress-token-disconnects.md.
-        """
+        """Regression: terminal progress notifications cause stdio client disconnects."""
         from unittest.mock import AsyncMock
 
         mock_access_controller.validate_model_access.return_value = None
@@ -892,10 +891,7 @@ class TestOdooToolHandler:
     async def test_list_models_emits_no_terminal_progress(
         self, handler, mock_access_controller, mock_app, valid_config
     ):
-        """Regression: list_models emitted terminal progress on the last loop iter.
-
-        See docs/issues/progress-token-disconnects.md.
-        """
+        """Regression: list_models emitted terminal progress on the last loop iter."""
         from unittest.mock import AsyncMock
 
         from mcp_server_odoo.access_control import ModelPermissions
@@ -2416,3 +2412,462 @@ class TestParseDomainInput:
         with pytest.raises(ValidationError) as exc_info:
             handler._parse_domain_input('{"key": "value"}')
         assert "Domain must be a list, got dict" in str(exc_info.value)
+
+
+class TestCallModelMethodTool:
+    """Test cases for the gated call_model_method tool."""
+
+    @pytest.fixture
+    def mock_app(self):
+        app = MagicMock(spec=FastMCP)
+        app._tools = {}
+
+        def tool_decorator(**kwargs):
+            def decorator(func):
+                app._tools[func.__name__] = func
+                return func
+
+            return decorator
+
+        app.tool = tool_decorator
+        return app
+
+    @pytest.fixture
+    def mock_connection(self):
+        connection = MagicMock(spec=OdooConnection)
+        connection.is_authenticated = True
+        connection.performance_manager = MagicMock()
+        return connection
+
+    @pytest.fixture
+    def mock_access_controller(self):
+        return MagicMock(spec=AccessController)
+
+    def _config(self, *, yolo_mode: str = "off", enable: bool = False) -> OdooConfig:
+        return OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            username="admin",
+            yolo_mode=yolo_mode,
+            enable_method_calls=enable,
+        )
+
+    def _enabled_handler(self, mock_app, mock_connection, mock_access_controller):
+        return OdooToolHandler(
+            mock_app,
+            mock_connection,
+            mock_access_controller,
+            self._config(yolo_mode="true", enable=True),
+        )
+
+    # --- Registration gating ---
+
+    def test_tool_not_registered_when_disabled_default(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        OdooToolHandler(mock_app, mock_connection, mock_access_controller, self._config())
+        assert "call_model_method" not in mock_app._tools
+
+    def test_tool_not_registered_when_yolo_read_even_with_enable(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        OdooToolHandler(
+            mock_app,
+            mock_connection,
+            mock_access_controller,
+            self._config(yolo_mode="read", enable=True),
+        )
+        assert "call_model_method" not in mock_app._tools
+
+    def test_tool_not_registered_when_yolo_off_even_with_enable(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        OdooToolHandler(
+            mock_app,
+            mock_connection,
+            mock_access_controller,
+            self._config(yolo_mode="off", enable=True),
+        )
+        assert "call_model_method" not in mock_app._tools
+
+    def test_tool_not_registered_when_yolo_full_without_enable(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        OdooToolHandler(
+            mock_app,
+            mock_connection,
+            mock_access_controller,
+            self._config(yolo_mode="true", enable=False),
+        )
+        assert "call_model_method" not in mock_app._tools
+
+    def test_tool_registered_when_both_flags_on(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        assert "call_model_method" in mock_app._tools
+
+    # --- Happy path ---
+
+    @pytest.mark.asyncio
+    async def test_happy_path_native_args(self, mock_app, mock_connection, mock_access_controller):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = {"type": "ir.actions.act_window_close"}
+
+        call_model_method = mock_app._tools["call_model_method"]
+        result = await call_model_method(
+            model="account.move",
+            method="action_post",
+            arguments=[[42]],
+        )
+
+        assert result.success is True
+        assert result.result == {"type": "ir.actions.act_window_close"}
+        assert result.message == "Successfully called account.move.action_post"
+        mock_access_controller.validate_model_access.assert_called_once_with(
+            "account.move", "write"
+        )
+        mock_connection.execute_kw.assert_called_once_with(
+            "account.move", "action_post", [[42]], {}
+        )
+        mock_connection.performance_manager.invalidate_record_cache.assert_called_once_with(
+            "account.move"
+        )
+
+    @pytest.mark.asyncio
+    async def test_native_kwargs_passed_through(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+
+        await mock_app._tools["call_model_method"](
+            model="res.partner",
+            method="some_action",
+            arguments=[[1]],
+            keyword_arguments={"context": {"lang": "en_US"}},
+        )
+
+        mock_connection.execute_kw.assert_called_once_with(
+            "res.partner", "some_action", [[1]], {"context": {"lang": "en_US"}}
+        )
+
+    @pytest.mark.asyncio
+    async def test_json_string_arguments_parsed(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+
+        await mock_app._tools["call_model_method"](
+            model="sale.order",
+            method="action_confirm",
+            arguments="[[7]]",
+        )
+
+        mock_connection.execute_kw.assert_called_once_with(
+            "sale.order", "action_confirm", [[7]], {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_json_string_kwargs_parsed(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+
+        await mock_app._tools["call_model_method"](
+            model="res.partner",
+            method="x",
+            arguments=[[1]],
+            keyword_arguments='{"context": {}}',
+        )
+
+        mock_connection.execute_kw.assert_called_once_with(
+            "res.partner", "x", [[1]], {"context": {}}
+        )
+
+    @pytest.mark.asyncio
+    async def test_arguments_default_to_empty_list_when_none(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+
+        await mock_app._tools["call_model_method"](model="res.partner", method="some_method")
+
+        mock_connection.execute_kw.assert_called_once_with("res.partner", "some_method", [], {})
+
+    # --- Argument-parsing error cases ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_arg, expected",
+        [
+            ("not json {[", "Invalid arguments parameter"),
+            ("null", "must be a list"),
+            ("42", "must be a list"),
+            ('"foo"', "must be a list"),
+            ('{"k": 1}', "must be a list"),
+        ],
+    )
+    async def test_invalid_arguments_string(
+        self, mock_app, mock_connection, mock_access_controller, bad_arg, expected
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match=expected):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=bad_arg
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_kwargs, expected",
+        [
+            ("not json", "Invalid keyword_arguments"),
+            ("null", "must be a dict"),
+            ("[1,2]", "must be a dict"),
+        ],
+    )
+    async def test_invalid_keyword_arguments_string(
+        self, mock_app, mock_connection, mock_access_controller, bad_kwargs, expected
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match=expected):
+            await mock_app._tools["call_model_method"](
+                model="res.partner",
+                method="x",
+                arguments=[[1]],
+                keyword_arguments=bad_kwargs,
+            )
+
+    @pytest.mark.asyncio
+    async def test_unsupported_native_type_for_arguments(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match="arguments must be a list or JSON-string"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=42
+            )
+
+    @pytest.mark.asyncio
+    async def test_unsupported_native_type_for_kwargs(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(
+            ValidationError, match="keyword_arguments must be a dict or JSON-string"
+        ):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=[[1]], keyword_arguments=42
+            )
+
+    # --- Validation guards ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_method",
+        [
+            "_compute_x",  # leading underscore
+            "__init__",  # dunder
+            "foo._private",  # dotted
+            "foo.bar",  # dotted (even fully public-looking)
+            "9bad",  # leading digit
+            "has-dash",  # invalid identifier char
+            "with space",  # whitespace inside
+        ],
+    )
+    async def test_non_public_method_rejected(
+        self, mock_app, mock_connection, mock_access_controller, bad_method
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match="public ASCII Python identifiers"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method=bad_method, arguments=[[1]]
+            )
+        mock_connection.execute_kw.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "good_method",
+        [
+            "action_post",
+            "toggle_active",
+            "name_search",
+            "read",
+            "x",  # single-letter still valid
+        ],
+    )
+    async def test_public_method_accepted(
+        self, mock_app, mock_connection, mock_access_controller, good_method
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+        await mock_app._tools["call_model_method"](
+            model="res.partner", method=good_method, arguments=[[1]]
+        )
+        mock_connection.execute_kw.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_model_rejected(self, mock_app, mock_connection, mock_access_controller):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match="model must not be empty"):
+            await mock_app._tools["call_model_method"](
+                model="   ", method="action_post", arguments=[[1]]
+            )
+
+    @pytest.mark.asyncio
+    async def test_empty_method_rejected(self, mock_app, mock_connection, mock_access_controller):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        with pytest.raises(ValidationError, match="method must not be empty"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="", arguments=[[1]]
+            )
+
+    @pytest.mark.asyncio
+    async def test_access_denied_translates(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_access_controller.validate_model_access.side_effect = AccessControlError("denied")
+        with pytest.raises(ValidationError, match="Access denied"):
+            await mock_app._tools["call_model_method"](
+                model="sale.order", method="action_confirm", arguments=[[1]]
+            )
+
+    @pytest.mark.asyncio
+    async def test_connection_error_translates(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.side_effect = OdooConnectionError("boom")
+        with pytest.raises(ValidationError, match="Connection error"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=[[1]]
+            )
+
+    @pytest.mark.asyncio
+    async def test_void_return_surfaces_as_success_with_none(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        """``execute_kw`` returning None (e.g. toggle_active) wraps as success(result=None).
+
+        The connection layer already translates Odoo's "cannot marshal None" fault
+        into a plain ``None`` return; see ``test_odoo_connection`` for that level.
+        """
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = None
+
+        result = await mock_app._tools["call_model_method"](
+            model="res.partner", method="toggle_active", arguments=[[1]]
+        )
+
+        assert result.success is True
+        assert result.result is None
+        mock_connection.performance_manager.invalidate_record_cache.assert_called_once_with(
+            "res.partner"
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_authenticated_rejected(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.is_authenticated = False
+        with pytest.raises(ValidationError, match="Not authenticated"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=[[1]]
+            )
+
+    @pytest.mark.asyncio
+    async def test_audit_log_emitted_on_success(
+        self, mock_app, mock_connection, mock_access_controller, caplog
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = True
+
+        with caplog.at_level("INFO", logger="mcp_server_odoo.tools"):
+            await mock_app._tools["call_model_method"](
+                model="account.move",
+                method="action_post",
+                arguments=[[42]],
+                keyword_arguments={"context": {"lang": "en_US"}},
+            )
+
+        audit = [r for r in caplog.records if "call_model_method invoked" in r.message]
+        assert audit, "expected audit log line"
+        msg = audit[0].getMessage()
+        assert "model=account.move" in msg
+        assert "method=action_post" in msg
+        assert "args_len=1" in msg
+        assert "kwargs_keys=['context']" in msg
+
+    @pytest.mark.asyncio
+    async def test_xmlrpc_binary_coerced_to_base64(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        """``xmlrpc.client.Binary`` is coerced to a base64 string (Pydantic-safe)."""
+        import xmlrpc.client
+
+        from mcp_server_odoo.schemas import CallModelMethodResult
+
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        mock_connection.execute_kw.return_value = [
+            {"id": 1, "image_1920": xmlrpc.client.Binary(b"hello")}
+        ]
+
+        result = await mock_app._tools["call_model_method"](
+            model="res.partner", method="read", arguments=[[1], ["image_1920"]]
+        )
+
+        assert isinstance(result, CallModelMethodResult)
+        # aGVsbG8= is base64("hello")
+        assert result.result == [{"id": 1, "image_1920": "aGVsbG8="}]
+        # And the whole thing actually serializes via Pydantic.
+        result.model_dump_json()
+
+    @pytest.mark.asyncio
+    async def test_xmlrpc_datetime_coerced_to_string(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        """``xmlrpc.client.DateTime`` is coerced to its ISO-string form."""
+        import xmlrpc.client
+
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        dt = xmlrpc.client.DateTime("20250101T12:34:56")
+        mock_connection.execute_kw.return_value = {"create_date": dt}
+
+        result = await mock_app._tools["call_model_method"](
+            model="res.partner", method="some_method", arguments=[[1]]
+        )
+
+        assert result.result == {"create_date": "20250101T12:34:56"}
+        result.model_dump_json()  # Pydantic must accept the coerced value
+
+    @pytest.mark.asyncio
+    async def test_oversize_arguments_rejected(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        """JSON-string ``arguments`` over the size cap is rejected before parsing."""
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        # 1.1 MB JSON string — past the cap; refuse before parsing.
+        oversize = "[" + "1," * 600_000 + "1]"
+        with pytest.raises(ValidationError, match="exceeds"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner", method="x", arguments=oversize
+            )
+
+    @pytest.mark.asyncio
+    async def test_oversize_keyword_arguments_rejected(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        self._enabled_handler(mock_app, mock_connection, mock_access_controller)
+        oversize = "{" + '"k":' + '"' + ("a" * 1_100_000) + '"' + "}"
+        with pytest.raises(ValidationError, match="exceeds"):
+            await mock_app._tools["call_model_method"](
+                model="res.partner",
+                method="x",
+                arguments=[[1]],
+                keyword_arguments=oversize,
+            )

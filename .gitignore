@@ -119,9 +119,12 @@ cython_debug/
 # Docs
 docs/_build/
 /site
+docs/
 
 # Misc
 .sass-cache/
 *.css.map
 *.sass.map
 *.scss.map
+
+.mcp.json

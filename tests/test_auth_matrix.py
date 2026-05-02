@@ -1,6 +1,6 @@
 """Auth matrix integration tests — covers all credential combinations.
 
-Tests every auth scenario from docs/auth-test-matrix.md:
+Tests every auth scenario:
 - Standard mode (S1–S7): API key and/or user/pass, with/without DB
 - YOLO read (Y1–Y6): Various credential combos, writes blocked
 - YOLO full (F1–F6): Same as read, writes allowed
@@ -273,7 +273,7 @@ class TestStandardAuthMatrix:
 class TestStandardRestrictedOps:
     """Standard mode: verify MCP module denies restricted operations.
 
-    Tests the exact restricted ops from docs/auth-test-matrix.md:
+    Restricted ops covered:
     - create on res.partner → denied (create=false in MCP config)
     - unlink on res.country → denied (unlink=false in MCP config)
     - read on res.users → denied (read=false / model not enabled)

@@ -183,3 +183,17 @@ class AggregateResult(BaseModel):
     model: str = Field(description="Odoo model name that was aggregated")
     groupby: List[str] = Field(description="Group-by expressions that were applied")
     aggregates: List[str] = Field(description="Aggregate expressions that were applied")
+
+
+# --- Call Model Method (XML-RPC execute_kw) ---
+
+
+class CallModelMethodResult(BaseModel):
+    """Result of invoking a public Odoo model method via XML-RPC execute_kw."""
+
+    success: bool = Field(description="Whether Odoo executed the method without RPC fault")
+    result: Any = Field(
+        default=None,
+        description="Return value from Odoo (type depends on the method; may be null)",
+    )
+    message: str = Field(description="Human-readable summary of the call")

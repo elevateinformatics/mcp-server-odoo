@@ -911,6 +911,13 @@ class OdooConnection:
                 kwargs.get("context", {}).pop("lang", None)
                 return self.execute_kw(model, method, args, kwargs)
 
+            # Odoo's XML-RPC marshaller (allow_none=False) faults on void
+            # returns, but the method already ran. Match the full dump_nil
+            # signature so unrelated faults mentioning "cannot marshal None"
+            # aren't silently swallowed.
+            if "cannot marshal None unless allow_none" in e.faultString:
+                return None
+
             logger.error(f"XML-RPC fault during {method} on {model}: {e}")
             # Sanitize the fault string before exposing to user
             sanitized_message = ErrorSanitizer.sanitize_xmlrpc_fault(e.faultString)

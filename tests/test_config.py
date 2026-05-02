@@ -400,3 +400,64 @@ class TestYoloMode:
             monkeypatch.setenv("ODOO_YOLO", value)
             config = load_config()
             assert config.yolo_mode == "true"
+
+
+class TestEnableMethodCalls:
+    """Tests for the ODOO_MCP_ENABLE_METHOD_CALLS opt-in flag."""
+
+    def test_default_is_false(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        # monkeypatch.setenv beats load_dotenv (which won't override existing
+        # env vars), so we get a deterministic falsy value even if a local
+        # .env file has the flag set.
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "")
+        config = load_config()
+        assert config.enable_method_calls is False
+
+    def test_truthy_values_enable(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_YOLO", "true")
+        for value in ["true", "1", "yes", "TRUE", "True"]:
+            monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", value)
+            config = load_config()
+            assert config.enable_method_calls is True, f"failed for {value!r}"
+
+    def test_falsy_values_disable(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        for value in ["false", "0", "no", "off", ""]:
+            monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", value)
+            config = load_config()
+            assert config.enable_method_calls is False, f"failed for {value!r}"
+
+    def test_warning_when_enabled_without_full_yolo(self, monkeypatch, caplog):
+        """Misconfiguration: opt-in without full YOLO emits a WARNING."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "true")
+
+        for yolo in ["off", "read"]:
+            monkeypatch.setenv("ODOO_YOLO", yolo)
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="mcp_server_odoo.config"):
+                load_config()
+            assert any(
+                "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored" in r.message for r in caplog.records
+            ), f"missing warning for yolo={yolo!r}"
+
+    def test_no_warning_when_enabled_with_full_yolo(self, monkeypatch, caplog):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_YOLO", "true")
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "true")
+
+        with caplog.at_level("WARNING", logger="mcp_server_odoo.config"):
+            load_config()
+        assert not any(
+            "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored" in r.message for r in caplog.records
+        )

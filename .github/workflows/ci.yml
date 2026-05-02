@@ -192,6 +192,7 @@ jobs:
         ODOO_USER: admin
         ODOO_PASSWORD: admin
         ODOO_YOLO: "true"
+        ODOO_MCP_ENABLE_METHOD_CALLS: "true"
         ODOO_API_KEY: ${{ steps.yolo-apikey.outputs.key }}
 
     - name: Upload coverage artifact

@@ -322,6 +322,7 @@ The server requires the following environment variables:
 | `ODOO_MCP_TRANSPORT` | `stdio` | Transport type (`stdio`, `streamable-http`) |
 | `ODOO_MCP_HOST` | `localhost` | Host to bind for HTTP transport |
 | `ODOO_MCP_PORT` | `8000` | Port to bind for HTTP transport |
+| `ODOO_MCP_ENABLE_METHOD_CALLS` | `false` | Enable the `call_model_method` tool. Requires `ODOO_YOLO=true`; ignored otherwise. ⚠️ Dangerous — see [`call_model_method`](#call_model_method) below. |
 
 ### Transport Options
 
@@ -623,6 +624,29 @@ Server-side aggregation. Use this whenever the question is "totals/counts/groupi
 {
   "model": "res.partner",
   "groupby": ["country_id"]
+}
+```
+
+### `call_model_method`
+Generic XML-RPC `execute_kw` escape hatch — invokes any **public** method on any model, for workflow actions not covered by CRUD (post invoice, confirm sale order, validate picking, etc.). Available **only** when both `ODOO_YOLO=true` (full YOLO) and `ODOO_MCP_ENABLE_METHOD_CALLS=true` are set; otherwise the tool is not registered. Only public ASCII Python identifiers are accepted as method names — dotted, dashed, whitespace, non-ASCII, and `_`-prefixed names are rejected.
+
+> [!WARNING]
+> This tool can invoke **any** public method, including destructive ones (e.g. `unlink`, `button_draft`, custom workflow methods). Enable only in trusted environments where you accept the blast radius. Odoo's record rules and ACLs still apply for the authenticated user.
+
+```json
+{
+  "model": "account.move",
+  "method": "action_post",
+  "arguments": [[42]]
+}
+```
+
+```json
+{
+  "model": "sale.order",
+  "method": "action_confirm",
+  "arguments": [[7]],
+  "keyword_arguments": {"context": {"lang": "en_US"}}
 }
 ```
 

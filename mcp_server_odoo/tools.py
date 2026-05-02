@@ -5,10 +5,13 @@ Tools are different from resources - they can have side effects and perform
 actions like creating, updating, or deleting records.
 """
 
+import base64
 import json
+import re
+import xmlrpc.client
 from ast import literal_eval as _parse_python_literal
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -24,6 +27,7 @@ from .logging_config import get_logger, perf_logger
 from .odoo_connection import OdooConnection, OdooConnectionError
 from .schemas import (
     AggregateResult,
+    CallModelMethodResult,
     CreateResult,
     DeleteResult,
     FieldSelectionMetadata,
@@ -36,6 +40,26 @@ from .schemas import (
 )
 
 logger = get_logger(__name__)
+
+# Public Odoo method = Python identifier not starting with "_".
+_PUBLIC_METHOD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# Refuse JSON strings larger than this on the parse path — bounds memory and
+# guards against pathological inputs.
+_MAX_JSON_PARAM_BYTES = 1_000_000
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce XML-RPC return types Pydantic can't serialize (Binary, DateTime)."""
+    if isinstance(value, xmlrpc.client.Binary):
+        return base64.b64encode(value.data).decode("ascii")
+    if isinstance(value, xmlrpc.client.DateTime):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 class OdooToolHandler:
@@ -719,6 +743,59 @@ class OdooToolHandler:
                 model, groupby, aggregates, domain, order, limit, offset, ctx
             )
             return AggregateResult(**result)
+
+        # Two-key opt-in: invisible to the client unless both flags are set.
+        if self.config.is_write_allowed and self.config.enable_method_calls:
+            logger.info("call_model_method tool ENABLED (full YOLO + ODOO_MCP_ENABLE_METHOD_CALLS)")
+
+            @self.app.tool(
+                title="Call Model Method",
+                annotations=ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+            async def call_model_method(
+                model: str,
+                method: str,
+                arguments: Optional[Union[List[Any], str]] = None,
+                keyword_arguments: Optional[Union[Dict[str, Any], str]] = None,
+                ctx: Optional[Context] = None,
+            ) -> CallModelMethodResult:
+                """Call a public Odoo model method via XML-RPC execute_kw.
+
+                Workflow escape hatch for actions not covered by CRUD: posting an
+                invoice (``account.move.action_post``), confirming a sale order
+                (``sale.order.action_confirm``), validating a picking, etc.
+
+                Available ONLY when the server runs with full YOLO and
+                ``ODOO_MCP_ENABLE_METHOD_CALLS=true``. Odoo still enforces record
+                rules and model ACLs for the authenticated user.
+
+                Args:
+                    model: Technical model name (e.g. ``account.move``).
+                    method: Public Python identifier. Dotted, dashed, whitespace,
+                        and ``_``-prefixed names are rejected.
+                    arguments: Positional argument list for ``execute_kw``, as a
+                        list or JSON-string. For recordset methods, the first
+                        element is typically the list of ids: ``[[42]]`` runs on
+                        id 42. Defaults to ``[]``.
+                    keyword_arguments: Optional dict (or JSON-object string) of
+                        keyword arguments for ``execute_kw`` (e.g. ``{"context": {...}}``).
+
+                Returns:
+                    ``CallModelMethodResult`` with the raw method return value in
+                    ``result`` (bool/dict/list/None depending on the method).
+
+                Prefer ``create_record`` / ``update_record`` / ``delete_record``
+                when sufficient.
+                """
+                result = await self._handle_call_model_method_tool(
+                    model, method, arguments, keyword_arguments, ctx
+                )
+                return CallModelMethodResult(**result)
 
     async def _handle_search_tool(
         self,
@@ -1540,6 +1617,123 @@ class OdooToolHandler:
             logger.error(f"Error in aggregate_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ValidationError(f"Aggregation failed: {sanitized_msg}") from e
+
+    @staticmethod
+    def _parse_execute_kw_arguments(value: Optional[Any]) -> List[Any]:
+        """Coerce the ``arguments`` parameter to a list (JSON-only)."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid arguments parameter. Expected JSON array, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, list):
+                raise ValidationError(f"arguments must be a list, got {type(parsed).__name__}")
+            return parsed
+        raise ValidationError(
+            f"arguments must be a list or JSON-string, got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _parse_execute_kw_kwargs(value: Optional[Any]) -> Dict[str, Any]:
+        """Coerce the ``keyword_arguments`` parameter to a dict (JSON-only)."""
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"keyword_arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid keyword_arguments parameter. Expected JSON object, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, dict):
+                raise ValidationError(
+                    f"keyword_arguments must be a dict, got {type(parsed).__name__}"
+                )
+            return parsed
+        raise ValidationError(
+            f"keyword_arguments must be a dict or JSON-string, got {type(value).__name__}"
+        )
+
+    async def _handle_call_model_method_tool(
+        self,
+        model: str,
+        method: str,
+        arguments: Optional[Any],
+        keyword_arguments: Optional[Any],
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle call_model_method tool request."""
+        try:
+            with perf_logger.track_operation("tool_call_model_method", model=model):
+                model = (model or "").strip()
+                method = (method or "").strip()
+                if not model:
+                    raise ValidationError("model must not be empty")
+                if not method:
+                    raise ValidationError("method must not be empty")
+                if not _PUBLIC_METHOD_RE.fullmatch(method):
+                    raise ValidationError(
+                        f"Refusing to call '{method}': only public ASCII Python "
+                        "identifiers are accepted; dotted, dashed, whitespace, "
+                        "non-ASCII, and _-prefixed names are rejected."
+                    )
+
+                # No-op under full YOLO; placeholder if the gate ever loosens.
+                self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Calling {model}.{method}(...)")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                args_list = self._parse_execute_kw_arguments(arguments)
+                kwargs_dict = self._parse_execute_kw_kwargs(keyword_arguments)
+
+                # Audit only what was called, not the values — kwargs may carry PII.
+                logger.info(
+                    "call_model_method invoked: model=%s method=%s args_len=%d kwargs_keys=%s",
+                    model,
+                    method,
+                    len(args_list),
+                    sorted(kwargs_dict.keys()),
+                )
+
+                rpc_result = self.connection.execute_kw(model, method, args_list, kwargs_dict)
+
+                # Workflow methods mutate state; flush the model's cache.
+                self.connection.performance_manager.invalidate_record_cache(model)
+
+                return {
+                    "success": True,
+                    "result": _json_safe(rpc_result),
+                    "message": f"Successfully called {model}.{method}",
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in call_model_method tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to call model method: {sanitized_msg}") from e
 
 
 def register_tools(
