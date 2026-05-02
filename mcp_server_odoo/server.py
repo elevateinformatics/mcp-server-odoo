@@ -26,7 +26,7 @@ from .tools import register_tools
 logger = get_logger(__name__)
 
 # Server version
-SERVER_VERSION = "0.5.1"
+SERVER_VERSION = "0.6.0"
 
 
 class OdooMCPServer:

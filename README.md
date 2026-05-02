@@ -19,6 +19,8 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🗑️ **Delete records** respecting model-level permissions
 - 🔢 **Count records** matching specific criteria
 - 📋 **Inspect model fields** to understand data structure
+- 📊 **Server-side aggregation** — group, sum, and count without pulling raw rows
+- ⚡ **Workflow actions** — invoke any public Odoo method (post invoice, confirm SO, etc.) via an opt-in escape hatch
 - 🔐 **Secure access** with API key or username/password authentication
 - 🎯 **Smart pagination** for large datasets
 - 🧠 **Smart field selection** — automatically picks the most relevant fields per model
@@ -301,6 +303,7 @@ The server requires the following environment variables:
 | `ODOO_DB` | No | Database name (auto-detected if not set) | `mycompany` |
 | `ODOO_LOCALE` | No | Language/locale for Odoo responses | `es_ES`, `fr_FR`, `de_DE` |
 | `ODOO_YOLO` | No | YOLO mode - bypasses MCP security (⚠️ DEV ONLY) | `off`, `read`, `true` |
+| `ODOO_MCP_ENABLE_METHOD_CALLS` | No | Enable the `call_model_method` tool — requires `ODOO_YOLO=true` (⚠️ Dangerous, see [`call_model_method`](#call_model_method)) | `false`, `true` |
 
 *Either `ODOO_API_KEY` or both `ODOO_USER` and `ODOO_PASSWORD` are required.
 
@@ -322,7 +325,6 @@ The server requires the following environment variables:
 | `ODOO_MCP_TRANSPORT` | `stdio` | Transport type (`stdio`, `streamable-http`) |
 | `ODOO_MCP_HOST` | `localhost` | Host to bind for HTTP transport |
 | `ODOO_MCP_PORT` | `8000` | Port to bind for HTTP transport |
-| `ODOO_MCP_ENABLE_METHOD_CALLS` | `false` | Enable the `call_model_method` tool. Requires `ODOO_YOLO=true`; ignored otherwise. ⚠️ Dangerous — see [`call_model_method`](#call_model_method) below. |
 
 ### Transport Options
 
