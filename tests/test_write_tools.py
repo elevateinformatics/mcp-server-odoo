@@ -413,12 +413,19 @@ class TestWriteToolsIntegration:
         """Posting a note to res.partner creates a mail.message linked to the record."""
         handler = real_tool_handler
 
+        # Plain-str → '&lt;' escape behavior is v17+ in mail.thread.message_post.
+        # On v16 the mail module strips text after '<' as if it were a tag.
+        # This test asserts on the modern behavior; skip on v16.
+        major = handler.connection.get_major_version()
+        if major is not None and major < 17:
+            pytest.skip(f"plain-str HTML escape is v17+; server is v{major}")
+
         # Use main_partner (always present) — we'll clean up the message afterwards
         partner_ids = handler.connection.search("res.partner", [], limit=1)
         assert partner_ids, "Need at least one res.partner for this test"
         partner_id = partner_ids[0]
 
-        # Body contains '<' so we can verify Odoo 19's plain-str escape behavior
+        # Body contains '<' so we can verify Odoo 17+'s plain-str escape behavior
         # (Odoo wraps any '<' in str body to '&lt;' when body_is_html is False).
         body = "MCP integration test: 5 < 10 & still works"
         result = await handler._handle_post_message_tool(

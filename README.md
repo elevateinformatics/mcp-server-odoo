@@ -607,6 +607,25 @@ Post a message to a record's chatter (`mail.thread`). `subtype="note"` (default)
 }
 ```
 
+### `aggregate_records`
+Server-side aggregation. Use this whenever the question is "totals/counts/groupings" rather than "list of records" — it pushes the work down to PostgreSQL instead of pulling raw rows. Dispatches to `formatted_read_group` on Odoo 19+ (the new dedicated method) and falls back to `read_group` with response normalization on older versions. Callers see a consistent response shape on every supported version. When `aggregates` is omitted, defaults to `["__count"]` so each group always carries a count.
+
+```json
+{
+  "model": "sale.order",
+  "groupby": ["date_order:month"],
+  "aggregates": ["amount_total:sum"],
+  "domain": [["state", "in", ["sale", "done"]]]
+}
+```
+
+```json
+{
+  "model": "res.partner",
+  "groupby": ["country_id"]
+}
+```
+
 ### Smart Field Selection
 
 When you omit the `fields` parameter (or set it to `null`), the server automatically selects the most relevant fields for each model using a scoring algorithm:

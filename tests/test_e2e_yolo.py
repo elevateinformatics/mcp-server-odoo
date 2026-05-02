@@ -504,3 +504,93 @@ class TestYoloOptInValidation:
                     password=os.getenv("ODOO_PASSWORD", "admin"),
                     yolo_mode=value,
                 )
+
+
+@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
+@pytest.mark.yolo
+class TestYoloAggregateRecordsE2E:
+    """Live YOLO mode tests for the aggregate_records tool (Odoo 17+)."""
+
+    @pytest.fixture
+    def config_read_only(self):
+        return OdooConfig(
+            url=os.getenv("ODOO_URL", "http://localhost:8069"),
+            database=os.getenv("ODOO_DB"),
+            username=os.getenv("ODOO_USER", "admin"),
+            password=os.getenv("ODOO_PASSWORD", "admin"),
+            yolo_mode="read",
+        )
+
+    @pytest.fixture
+    def handler(self, config_read_only):
+        connection = OdooConnection(config_read_only)
+        connection.connect()
+        connection.authenticate()
+        access_controller = AccessController(config_read_only)
+        app = MagicMock()
+        yield OdooToolHandler(app, connection, access_controller, config_read_only)
+        connection.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_count_partners_by_country(self, handler):
+        """Default aggregate (caller passes None) → tool injects ['__count'].
+
+        Works on every supported Odoo version: v19+ via formatted_read_group,
+        v16/v17/v18 via the read_group fallback path with normalization.
+        """
+        result = await handler._handle_aggregate_records_tool(
+            model="res.partner",
+            groupby=["country_id"],
+            aggregates=None,
+            domain=None,
+            order=None,
+            limit=20,
+            offset=0,
+        )
+
+        assert result["model"] == "res.partner"
+        assert result["groupby"] == ["country_id"]
+        assert result["aggregates"] == ["__count"]
+        assert isinstance(result["groups"], list)
+        assert result["groups"], "Expected at least one group"
+        for bucket in result["groups"]:
+            assert "__count" in bucket
+            assert "country_id" in bucket
+
+    @pytest.mark.asyncio
+    async def test_aggregate_with_explicit_aggregate(self, handler):
+        """Explicit aggregate expression appears in each bucket.
+
+        Uses ``partner_share:count_distinct`` rather than ``id:count`` because
+        v16's read_group silently elides ``id:count`` when ``__count`` is
+        already implicit. Non-id aggregates work on every version.
+        """
+        result = await handler._handle_aggregate_records_tool(
+            model="res.partner",
+            groupby=["is_company"],
+            aggregates=["partner_share:count_distinct"],
+            domain=[["active", "=", True]],
+            order=None,
+            limit=10,
+            offset=0,
+        )
+
+        assert result["aggregates"] == ["partner_share:count_distinct"]
+        assert isinstance(result["groups"], list)
+        for bucket in result["groups"]:
+            assert "partner_share:count_distinct" in bucket
+
+    @pytest.mark.asyncio
+    async def test_empty_groupby_rejected(self, handler):
+        """Empty groupby is rejected before any network call."""
+        with pytest.raises(ValidationError) as exc_info:
+            await handler._handle_aggregate_records_tool(
+                model="res.partner",
+                groupby=[],
+                aggregates=None,
+                domain=None,
+                order=None,
+                limit=None,
+                offset=0,
+            )
+        assert "groupby must not be empty" in str(exc_info.value)
