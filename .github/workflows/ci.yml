@@ -192,6 +192,7 @@ jobs:
         ODOO_USER: admin
         ODOO_PASSWORD: admin
         ODOO_YOLO: "true"
+        ODOO_MCP_ENABLE_METHOD_CALLS: "true"
         ODOO_API_KEY: ${{ steps.yolo-apikey.outputs.key }}
 
     - name: Upload coverage artifact
@@ -295,13 +296,17 @@ jobs:
 
         models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object')
 
-        # Enable MCP with API key validation
+        # Enable MCP with API key validation. Rate limiting is disabled in CI:
+        # the suite hits the addon's ~300/min ceiling because all tests run
+        # under the single admin API key. Disabling it here keeps tests
+        # deterministic — production deployments leave it on (default True).
         for param, value in [
             ('mcp_server.enabled', 'True'),
             ('mcp_server.use_api_keys', 'True'),
+            ('mcp_server.enable_rate_limiting', 'False'),
         ]:
             models.execute_kw(db, uid, 'admin', 'ir.config_parameter', 'set_param', [param, value])
-        print('MCP enabled, API keys enabled')
+        print('MCP enabled, API keys enabled, rate limiting disabled (CI only)')
 
         # Enable models with permissions matching auth-test-matrix.md:
         # - res.partner: read+write+unlink only (create=False for restricted ops test)
@@ -388,7 +393,7 @@ jobs:
         python-version: '3.10'
 
     - name: Merge and upload coverage
-      uses: codecov/codecov-action@v5
+      uses: codecov/codecov-action@v6
       with:
         directory: coverage-reports
         flags: all

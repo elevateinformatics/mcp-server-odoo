@@ -911,6 +911,13 @@ class OdooConnection:
                 kwargs.get("context", {}).pop("lang", None)
                 return self.execute_kw(model, method, args, kwargs)
 
+            # Odoo's XML-RPC marshaller (allow_none=False) faults on void
+            # returns, but the method already ran. Match the full dump_nil
+            # signature so unrelated faults mentioning "cannot marshal None"
+            # aren't silently swallowed.
+            if "cannot marshal None unless allow_none" in e.faultString:
+                return None
+
             logger.error(f"XML-RPC fault during {method} on {model}: {e}")
             # Sanitize the fault string before exposing to user
             sanitized_message = ErrorSanitizer.sanitize_xmlrpc_fault(e.faultString)
@@ -1120,10 +1127,15 @@ class OdooConnection:
             logger.error(f"Failed to get server version: {e}")
             return None
 
-    def _get_major_version(self) -> Optional[int]:
-        """Extract the major version number from the server version string.
+    def get_major_version(self) -> Optional[int]:
+        """Return the Odoo major version number, or ``None`` if unknown.
 
-        Handles standard versions (e.g. '18.0') and SaaS versions (e.g. 'saas~18.1').
+        Handles standard versions (e.g. ``'18.0'`` → ``18``) and SaaS
+        versions (e.g. ``'saas~18.1'`` → ``18``). Reads the cached
+        ``_server_version`` populated during ``connect()``.
+
+        Public so that tool handlers can branch on Odoo version (e.g. to
+        choose between ``formatted_read_group`` and ``read_group``).
         """
         if not self._server_version:
             return None
@@ -1143,7 +1155,7 @@ class OdooConnection:
         /web# hash format for older versions.
         """
         base_url = self._url_components["base_url"]
-        major = self._get_major_version()
+        major = self.get_major_version()
         if major is not None and major >= 18:
             return f"{base_url}/odoo/{model}/{record_id}"
         return f"{base_url}/web#id={record_id}&model={model}&view_type=form"

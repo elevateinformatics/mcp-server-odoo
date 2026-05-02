@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-05-02
+
+### Added
+- **`aggregate_records` tool**: Server-side aggregation via Odoo's grouping methods (#64). Dispatches to `formatted_read_group` on Odoo 19+ and falls back to `read_group` with response normalization on older versions.
+- **`call_model_method` tool** (YOLO-only, opt-in via `ODOO_MCP_ENABLE_METHOD_CALLS`): generic XML-RPC `execute_kw` escape hatch for workflow actions not covered by CRUD.
+
+### Fixed
+- **Concurrent tool calls**: Per-proxy XML-RPC transport prevents wire-state corruption when multiple tools run in parallel (#44).
+- **CI**: Disable MCP rate limiting in integration tests — the 300/min ceiling tripped mid-suite under the shared admin API key. Production keeps the default.
+
 ## [0.5.2] - 2026-04-30
 
 ### Added

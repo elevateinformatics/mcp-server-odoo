@@ -5,9 +5,13 @@ Tools are different from resources - they can have side effects and perform
 actions like creating, updating, or deleting records.
 """
 
+import base64
 import json
+import re
+import xmlrpc.client
+from ast import literal_eval as _parse_python_literal
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -22,6 +26,8 @@ from .error_sanitizer import ErrorSanitizer
 from .logging_config import get_logger, perf_logger
 from .odoo_connection import OdooConnection, OdooConnectionError
 from .schemas import (
+    AggregateResult,
+    CallModelMethodResult,
     CreateResult,
     DeleteResult,
     FieldSelectionMetadata,
@@ -34,6 +40,26 @@ from .schemas import (
 )
 
 logger = get_logger(__name__)
+
+# Public Odoo method = Python identifier not starting with "_".
+_PUBLIC_METHOD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# Refuse JSON strings larger than this on the parse path — bounds memory and
+# guards against pathological inputs.
+_MAX_JSON_PARAM_BYTES = 1_000_000
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce XML-RPC return types Pydantic can't serialize (Binary, DateTime)."""
+    if isinstance(value, xmlrpc.client.Binary):
+        return base64.b64encode(value.data).decode("ascii")
+    if isinstance(value, xmlrpc.client.DateTime):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 class OdooToolHandler:
@@ -316,6 +342,41 @@ class OdooToolHandler:
             logger.warning(f"Could not determine default fields for {model}: {e}")
             # Return None to indicate we should get all fields
             return None
+
+    def _parse_domain_input(self, domain: Optional[Any]) -> List[Any]:
+        """Coerce a domain parameter into an Odoo domain list.
+
+        Accepts a list (passed through), a JSON string, a Python-literal
+        string with single quotes / ``True``/``False`` capitalization, or
+        ``None`` (returns ``[]``). Raises ``ValidationError`` on anything
+        that doesn't yield a list.
+        """
+        if domain is None:
+            return []
+        if not isinstance(domain, str):
+            return domain
+
+        try:
+            parsed = json.loads(domain)
+        except json.JSONDecodeError:
+            try:
+                json_domain = domain.replace("'", '"')
+                json_domain = json_domain.replace("True", "true").replace("False", "false")
+                parsed = json.loads(json_domain)
+            except json.JSONDecodeError as e:
+                try:
+                    parsed = _parse_python_literal(domain)
+                except (ValueError, SyntaxError):
+                    raise ValidationError(
+                        f"Invalid domain parameter. Expected JSON array or Python list, "
+                        f"got: {domain[:100]}..."
+                    ) from e
+
+        if not isinstance(parsed, list):
+            raise ValidationError(f"Domain must be a list, got {type(parsed).__name__}")
+
+        logger.debug(f"Parsed domain from string: {parsed}")
+        return parsed
 
     async def _ctx_info(self, ctx, message: str):
         """Send info to MCP client context if available."""
@@ -612,6 +673,130 @@ class OdooToolHandler:
             )
             return PostMessageResult(**result)
 
+        @self.app.tool(
+            title="Aggregate Records",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def aggregate_records(
+            model: str,
+            groupby: List[str],
+            aggregates: Optional[List[str]] = None,
+            domain: Optional[Any] = None,
+            order: Optional[str] = None,
+            limit: Optional[int] = None,
+            offset: int = 0,
+            ctx: Optional[Context] = None,
+        ) -> AggregateResult:
+            """Aggregate records server-side via Odoo's grouping methods.
+
+            Use this tool whenever the question is "totals/counts/groupings",
+            not "list of records". It pushes the aggregation down to Odoo
+            instead of pulling raw records and reducing client-side.
+
+            Dispatches by Odoo version: ``formatted_read_group`` on 19+
+            (the new dedicated method), falls back to ``read_group`` on
+            older versions with response-shape normalization. Callers see
+            the same response shape on every supported version.
+
+            Args:
+                model: Odoo model name (e.g. 'sale.order')
+                groupby: One or more group expressions. Field names, optionally
+                    with a granularity suffix for date/datetime fields:
+                    ``["date_order:month"]``, ``["partner_id"]``,
+                    ``["partner_id", "date_order:year"]``.
+                aggregates: Aggregate expressions of the form ``"field:operator"``
+                    (sum, avg, min, max, count, count_distinct, array_agg, ...).
+                    Examples: ``["amount_total:sum"]``, ``["id:count"]``.
+                    If omitted or empty, defaults to ``["__count"]`` so each
+                    group carries a count. Pass ``["__count", "amount_total:sum"]``
+                    to get both.
+                domain: Odoo domain filter — list, JSON string, or None.
+                order: Sort expression over groupby keys / aggregates,
+                    e.g. ``"date_order:month"`` or ``"amount_total:sum desc"``.
+                limit: Maximum number of groups. Defaults to
+                    ``ODOO_MCP_DEFAULT_LIMIT``; capped at ``ODOO_MCP_MAX_LIMIT``.
+                offset: Number of groups to skip.
+
+            Returns:
+                ``AggregateResult`` with ``groups`` (list of dicts; each contains
+                the groupby keys, ``__count``, and any requested aggregates),
+                plus the echoed ``model``, ``groupby``, and ``aggregates``.
+
+            Examples:
+                # Sales by month
+                aggregate_records(
+                    "sale.order",
+                    groupby=["date_order:month"],
+                    aggregates=["amount_total:sum"],
+                    domain=[["state", "in", ["sale", "done"]]],
+                )
+
+                # Partner count by country
+                aggregate_records("res.partner", groupby=["country_id"])
+            """
+            result = await self._handle_aggregate_records_tool(
+                model, groupby, aggregates, domain, order, limit, offset, ctx
+            )
+            return AggregateResult(**result)
+
+        # Two-key opt-in: invisible to the client unless both flags are set.
+        if self.config.is_write_allowed and self.config.enable_method_calls:
+            logger.info("call_model_method tool ENABLED (full YOLO + ODOO_MCP_ENABLE_METHOD_CALLS)")
+
+            @self.app.tool(
+                title="Call Model Method",
+                annotations=ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+            async def call_model_method(
+                model: str,
+                method: str,
+                arguments: Optional[Union[List[Any], str]] = None,
+                keyword_arguments: Optional[Union[Dict[str, Any], str]] = None,
+                ctx: Optional[Context] = None,
+            ) -> CallModelMethodResult:
+                """Call a public Odoo model method via XML-RPC execute_kw.
+
+                Workflow escape hatch for actions not covered by CRUD: posting an
+                invoice (``account.move.action_post``), confirming a sale order
+                (``sale.order.action_confirm``), validating a picking, etc.
+
+                Available ONLY when the server runs with full YOLO and
+                ``ODOO_MCP_ENABLE_METHOD_CALLS=true``. Odoo still enforces record
+                rules and model ACLs for the authenticated user.
+
+                Args:
+                    model: Technical model name (e.g. ``account.move``).
+                    method: Public Python identifier. Dotted, dashed, whitespace,
+                        and ``_``-prefixed names are rejected.
+                    arguments: Positional argument list for ``execute_kw``, as a
+                        list or JSON-string. For recordset methods, the first
+                        element is typically the list of ids: ``[[42]]`` runs on
+                        id 42. Defaults to ``[]``.
+                    keyword_arguments: Optional dict (or JSON-object string) of
+                        keyword arguments for ``execute_kw`` (e.g. ``{"context": {...}}``).
+
+                Returns:
+                    ``CallModelMethodResult`` with the raw method return value in
+                    ``result`` (bool/dict/list/None depending on the method).
+
+                Prefer ``create_record`` / ``update_record`` / ``delete_record``
+                when sufficient.
+                """
+                result = await self._handle_call_model_method_tool(
+                    model, method, arguments, keyword_arguments, ctx
+                )
+                return CallModelMethodResult(**result)
+
     async def _handle_search_tool(
         self,
         model: str,
@@ -633,45 +818,7 @@ class OdooToolHandler:
                 if not self.connection.is_authenticated:
                     raise ValidationError("Not authenticated with Odoo")
 
-                # Handle domain parameter - can be string or list
-                parsed_domain = []
-                if domain is not None:
-                    if isinstance(domain, str):
-                        # Parse string to list
-                        try:
-                            # First try standard JSON parsing
-                            parsed_domain = json.loads(domain)
-                        except json.JSONDecodeError:
-                            # If that fails, try converting single quotes to double quotes
-                            # This handles Python-style domain strings
-                            try:
-                                # Replace single quotes with double quotes for valid JSON
-                                # But be careful not to replace quotes inside string values
-                                json_domain = domain.replace("'", '"')
-                                # Also need to ensure Python True/False are lowercase for JSON
-                                json_domain = json_domain.replace("True", "true").replace(
-                                    "False", "false"
-                                )
-                                parsed_domain = json.loads(json_domain)
-                            except json.JSONDecodeError as e:
-                                # If both attempts fail, try evaluating as Python literal
-                                try:
-                                    import ast
-
-                                    parsed_domain = ast.literal_eval(domain)
-                                except (ValueError, SyntaxError):
-                                    raise ValidationError(
-                                        f"Invalid domain parameter. Expected JSON array or Python list, got: {domain[:100]}..."
-                                    ) from e
-
-                        if not isinstance(parsed_domain, list):
-                            raise ValidationError(
-                                f"Domain must be a list, got {type(parsed_domain).__name__}"
-                            )
-                        logger.debug(f"Parsed domain from string: {parsed_domain}")
-                    else:
-                        # Already a list
-                        parsed_domain = domain
+                parsed_domain = self._parse_domain_input(domain)
 
                 # Handle fields parameter - can be string or list
                 parsed_fields = fields
@@ -1308,6 +1455,285 @@ class OdooToolHandler:
             logger.error(f"Error in post_message tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ValidationError(f"Failed to post message: {sanitized_msg}") from e
+
+    # Metadata keys we always preserve in normalized read_group output.
+    # Anything else not in the requested groupby/aggregates is filtered
+    # out — read_group with empty ``fields=`` defaults to ALL aggregator
+    # fields on the model, which leaks unrelated numeric fields.
+    _READ_GROUP_META_KEYS = frozenset({"__count", "__extra_domain", "__range", "__fold"})
+
+    def _call_read_group_normalized(
+        self,
+        model: str,
+        domain: List[Any],
+        groupby: List[str],
+        aggregates: List[str],
+        order: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        """Call legacy ``read_group`` and normalize its response shape.
+
+        Odoo < 19 doesn't have ``formatted_read_group``. ``read_group`` is
+        the long-standing alternative; with ``lazy=False`` its response is
+        already close to the v19 shape. Three normalizations:
+
+        * ``__domain`` → ``__extra_domain`` (key rename, per v19 convention).
+        * Aggregate keys: read_group emits aggregate values keyed by the
+          bare field name (e.g. ``"id:count"`` is returned as ``"id"``);
+          rename back to ``"field:op"`` to match v19.
+        * Bucket key whitelist: drop fields the caller didn't request.
+          read_group with empty ``fields=`` returns all aggregator fields
+          on the model (e.g. ``message_bounce``, ``partner_latitude``);
+          formatted_read_group never does that. Filter to keep only what
+          the caller asked for plus metadata keys (``__count``, etc.).
+
+        Translates kwargs:
+            * ``aggregates`` → ``fields`` (drop ``__count``; read_group emits
+              it implicitly when ``lazy=False``).
+            * ``order`` → ``orderby`` (omit entirely when ``None`` so
+              read_group uses its default).
+        """
+        # __count is implicit in read_group; passing it as a field raises a fault.
+        fields_kwarg = [a for a in aggregates if a != "__count"]
+
+        kwargs: Dict[str, Any] = {
+            "fields": fields_kwarg,
+            "groupby": groupby,
+            "limit": limit,
+            "offset": offset,
+            "lazy": False,
+        }
+        if order is not None:
+            kwargs["orderby"] = order
+
+        groups = self.connection.execute_kw(model, "read_group", [domain], kwargs)
+
+        # Aggregate key rename: build a list of (bare_field, full_expr)
+        # pairs to restore after read_group strips the operator suffix.
+        # Skip aggregates whose bare field collides with a groupby key —
+        # the groupby value already lives under that key.
+        groupby_field_names = {g.split(":", 1)[0] for g in groupby}
+        agg_renames = [
+            (a.split(":", 1)[0], a)
+            for a in fields_kwarg
+            if ":" in a and a.split(":", 1)[0] not in groupby_field_names
+        ]
+
+        # Whitelist of keys allowed in the final bucket: groupby specs +
+        # requested aggregates (post-rename) + known metadata keys.
+        allowed_keys = self._READ_GROUP_META_KEYS | set(groupby) | set(fields_kwarg)
+
+        normalized: List[Dict[str, Any]] = []
+        for bucket in groups:
+            if "__domain" in bucket:
+                bucket["__extra_domain"] = bucket.pop("__domain")
+            for bare, full in agg_renames:
+                if bare in bucket and full != bare:
+                    bucket[full] = bucket.pop(bare)
+            normalized.append({k: v for k, v in bucket.items() if k in allowed_keys})
+        return normalized
+
+    async def _handle_aggregate_records_tool(
+        self,
+        model: str,
+        groupby: List[str],
+        aggregates: Optional[List[str]],
+        domain: Optional[Any],
+        order: Optional[str],
+        limit: Optional[int],
+        offset: int,
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle aggregate_records tool request."""
+        try:
+            with perf_logger.track_operation("tool_aggregate_records", model=model):
+                # Access check (read permission — same as search_records)
+                self.access_controller.validate_model_access(model, "read")
+                await self._ctx_info(ctx, f"Aggregating {model}...")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate groupby — empty groupby collapses to a single
+                # bucket, which search_count already covers.
+                if not groupby:
+                    raise ValidationError(
+                        "groupby must not be empty (use search_count for an unfiltered total)."
+                    )
+
+                parsed_domain = self._parse_domain_input(domain)
+
+                # Limit defaults & capping (mirror search_records)
+                if limit is None or limit <= 0:
+                    limit = self.config.default_limit
+                elif limit > self.config.max_limit:
+                    limit = self.config.max_limit
+
+                # Default to ['__count'] when caller omits aggregates —
+                # otherwise formatted_read_group returns only the groupby
+                # keys with no quantitative data, which defeats the tool.
+                effective_aggregates = aggregates if aggregates else ["__count"]
+
+                # Version dispatch: formatted_read_group is Odoo 19+ only;
+                # fall back to read_group with response normalization on
+                # older versions. When the version is unknown (None), assume
+                # newer and let the XML-RPC fault surface — the caller can
+                # set ODOO_DB or check the connection log.
+                major = self.connection.get_major_version()
+                if major is not None and major < 19:
+                    groups = self._call_read_group_normalized(
+                        model, parsed_domain, groupby, effective_aggregates, order, limit, offset
+                    )
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "groupby": groupby,
+                        "aggregates": effective_aggregates,
+                        "limit": limit,
+                        "offset": offset,
+                    }
+                    if order is not None:
+                        kwargs["order"] = order
+                    groups = self.connection.execute_kw(
+                        model, "formatted_read_group", [parsed_domain], kwargs
+                    )
+
+                await self._ctx_info(ctx, f"Returning {len(groups)} groups")
+
+                return {
+                    "groups": groups,
+                    "model": model,
+                    "groupby": groupby,
+                    "aggregates": effective_aggregates,
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in aggregate_records tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Aggregation failed: {sanitized_msg}") from e
+
+    @staticmethod
+    def _parse_execute_kw_arguments(value: Optional[Any]) -> List[Any]:
+        """Coerce the ``arguments`` parameter to a list (JSON-only)."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid arguments parameter. Expected JSON array, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, list):
+                raise ValidationError(f"arguments must be a list, got {type(parsed).__name__}")
+            return parsed
+        raise ValidationError(
+            f"arguments must be a list or JSON-string, got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _parse_execute_kw_kwargs(value: Optional[Any]) -> Dict[str, Any]:
+        """Coerce the ``keyword_arguments`` parameter to a dict (JSON-only)."""
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"keyword_arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid keyword_arguments parameter. Expected JSON object, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, dict):
+                raise ValidationError(
+                    f"keyword_arguments must be a dict, got {type(parsed).__name__}"
+                )
+            return parsed
+        raise ValidationError(
+            f"keyword_arguments must be a dict or JSON-string, got {type(value).__name__}"
+        )
+
+    async def _handle_call_model_method_tool(
+        self,
+        model: str,
+        method: str,
+        arguments: Optional[Any],
+        keyword_arguments: Optional[Any],
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle call_model_method tool request."""
+        try:
+            with perf_logger.track_operation("tool_call_model_method", model=model):
+                model = (model or "").strip()
+                method = (method or "").strip()
+                if not model:
+                    raise ValidationError("model must not be empty")
+                if not method:
+                    raise ValidationError("method must not be empty")
+                if not _PUBLIC_METHOD_RE.fullmatch(method):
+                    raise ValidationError(
+                        f"Refusing to call '{method}': only public ASCII Python "
+                        "identifiers are accepted; dotted, dashed, whitespace, "
+                        "non-ASCII, and _-prefixed names are rejected."
+                    )
+
+                # No-op under full YOLO; placeholder if the gate ever loosens.
+                self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Calling {model}.{method}(...)")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                args_list = self._parse_execute_kw_arguments(arguments)
+                kwargs_dict = self._parse_execute_kw_kwargs(keyword_arguments)
+
+                # Audit only what was called, not the values — kwargs may carry PII.
+                logger.info(
+                    "call_model_method invoked: model=%s method=%s args_len=%d kwargs_keys=%s",
+                    model,
+                    method,
+                    len(args_list),
+                    sorted(kwargs_dict.keys()),
+                )
+
+                rpc_result = self.connection.execute_kw(model, method, args_list, kwargs_dict)
+
+                # Workflow methods mutate state; flush the model's cache.
+                self.connection.performance_manager.invalidate_record_cache(model)
+
+                return {
+                    "success": True,
+                    "result": _json_safe(rpc_result),
+                    "message": f"Successfully called {model}.{method}",
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in call_model_method tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to call model method: {sanitized_msg}") from e
 
 
 def register_tools(

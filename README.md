@@ -19,6 +19,8 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🗑️ **Delete records** respecting model-level permissions
 - 🔢 **Count records** matching specific criteria
 - 📋 **Inspect model fields** to understand data structure
+- 📊 **Server-side aggregation** — group, sum, and count without pulling raw rows
+- ⚡ **Workflow actions** — invoke any public Odoo method (post invoice, confirm SO, etc.) via an opt-in escape hatch
 - 🔐 **Secure access** with API key or username/password authentication
 - 🎯 **Smart pagination** for large datasets
 - 🧠 **Smart field selection** — automatically picks the most relevant fields per model
@@ -301,6 +303,7 @@ The server requires the following environment variables:
 | `ODOO_DB` | No | Database name (auto-detected if not set) | `mycompany` |
 | `ODOO_LOCALE` | No | Language/locale for Odoo responses | `es_ES`, `fr_FR`, `de_DE` |
 | `ODOO_YOLO` | No | YOLO mode - bypasses MCP security (⚠️ DEV ONLY) | `off`, `read`, `true` |
+| `ODOO_MCP_ENABLE_METHOD_CALLS` | No | Enable the `call_model_method` tool — requires `ODOO_YOLO=true` (⚠️ Dangerous, see [`call_model_method`](#call_model_method)) | `false`, `true` |
 
 *Either `ODOO_API_KEY` or both `ODOO_USER` and `ODOO_PASSWORD` are required.
 
@@ -604,6 +607,48 @@ Post a message to a record's chatter (`mail.thread`). `subtype="note"` (default)
   "body": "<p>Shipping confirmed for Monday</p>",
   "subtype": "comment",
   "body_is_html": true
+}
+```
+
+### `aggregate_records`
+Server-side aggregation. Use this whenever the question is "totals/counts/groupings" rather than "list of records" — it pushes the work down to PostgreSQL instead of pulling raw rows. Dispatches to `formatted_read_group` on Odoo 19+ (the new dedicated method) and falls back to `read_group` with response normalization on older versions. Callers see a consistent response shape on every supported version. When `aggregates` is omitted, defaults to `["__count"]` so each group always carries a count.
+
+```json
+{
+  "model": "sale.order",
+  "groupby": ["date_order:month"],
+  "aggregates": ["amount_total:sum"],
+  "domain": [["state", "in", ["sale", "done"]]]
+}
+```
+
+```json
+{
+  "model": "res.partner",
+  "groupby": ["country_id"]
+}
+```
+
+### `call_model_method`
+Generic XML-RPC `execute_kw` escape hatch — invokes any **public** method on any model, for workflow actions not covered by CRUD (post invoice, confirm sale order, validate picking, etc.). Available **only** when both `ODOO_YOLO=true` (full YOLO) and `ODOO_MCP_ENABLE_METHOD_CALLS=true` are set; otherwise the tool is not registered. Only public ASCII Python identifiers are accepted as method names — dotted, dashed, whitespace, non-ASCII, and `_`-prefixed names are rejected.
+
+> [!WARNING]
+> This tool can invoke **any** public method, including destructive ones (e.g. `unlink`, `button_draft`, custom workflow methods). Enable only in trusted environments where you accept the blast radius. Odoo's record rules and ACLs still apply for the authenticated user.
+
+```json
+{
+  "model": "account.move",
+  "method": "action_post",
+  "arguments": [[42]]
+}
+```
+
+```json
+{
+  "model": "sale.order",
+  "method": "action_confirm",
+  "arguments": [[7]],
+  "keyword_arguments": {"context": {"lang": "en_US"}}
 }
 ```
 

@@ -380,3 +380,49 @@ class TestExecuteKwErrorHandling:
 
         kwargs = conn._object_proxy.execute_kw.call_args[0][6]
         assert kwargs["context"]["lang"] == "de_DE"
+
+    def test_marshal_none_fault_returns_none(self, connected_connection):
+        """Odoo's "cannot marshal None" fault is translated to a None return.
+
+        Methods like ``toggle_active`` and ``action_archive`` mutate state then
+        return ``None``. Odoo's XML-RPC marshaller is configured with
+        ``allow_none=False`` and raises a Fault on the response — even though
+        the call already succeeded server-side. ``execute_kw`` recognizes this
+        and returns ``None`` so callers see normal Python semantics.
+        """
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "Traceback (most recent call last):\n"
+            "  File ..., in dump_nil\n"
+            "    raise TypeError('cannot marshal None unless allow_none is enabled')\n"
+            "TypeError: cannot marshal None unless allow_none is enabled",
+        )
+
+        result = conn.execute_kw("res.partner", "toggle_active", [[1]], {})
+        assert result is None
+
+    def test_other_xmlrpc_fault_still_raises(self, connected_connection):
+        """A regular Odoo Fault is still wrapped as OdooConnectionError."""
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "ValueError: Invalid field 'bad_field' on model 'res.partner'",
+        )
+
+        with pytest.raises(OdooConnectionError, match="Operation failed"):
+            conn.execute_kw("res.partner", "do_thing", [[1]], {})
+
+    def test_marshal_none_substring_alone_does_not_swallow(self, connected_connection):
+        """Only the full ``cannot marshal None unless allow_none`` signature is treated
+        as a void return. A fault whose message merely contains the looser substring
+        "cannot marshal None" must still raise — not be silently turned into None.
+        """
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "ValidationError: User said 'cannot marshal None' in a message — distinct fault",
+        )
+
+        with pytest.raises(OdooConnectionError, match="Operation failed"):
+            conn.execute_kw("res.partner", "do_thing", [[1]], {})

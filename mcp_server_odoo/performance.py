@@ -297,7 +297,9 @@ class ConnectionPool:
         self._connections: List[Tuple[ServerProxy, float]] = []
         self._endpoint_map: List[str] = []  # Track endpoints for each connection
         self._lock = threading.RLock()
-        # Use OdooSafeTransport/OdooTransport to support X-Odoo-Database header
+        # Template — only its `database` field is read in get_connection. We don't
+        # share transports across proxies: xmlrpc.client.Transport keeps per-instance
+        # keep-alive state that races under concurrent tool calls.
         if config.url.startswith("https://"):
             self._transport: Union[OdooTransport, OdooSafeTransport] = OdooSafeTransport()
         else:
@@ -352,7 +354,11 @@ class ConnectionPool:
                 self._endpoint_map.pop(0)
                 self._stats["connections_closed"] += 1
 
-            conn = ServerProxy(url, transport=self._transport, allow_none=True)
+            if self.config.url.startswith("https://"):
+                transport = OdooSafeTransport(database=self._transport.database)
+            else:
+                transport = OdooTransport(database=self._transport.database)
+            conn = ServerProxy(url, transport=transport, allow_none=True)
             self._connections.append((conn, now))
             self._endpoint_map.append(endpoint)
             self._stats["connections_created"] += 1

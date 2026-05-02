@@ -166,3 +166,34 @@ class PostMessageResult(BaseModel):
 
     success: bool = Field(description="Whether the message was posted successfully")
     message_id: int = Field(description="ID of the created mail.message record")
+
+
+# --- Aggregate Records ---
+
+
+class AggregateResult(BaseModel):
+    """Result of a server-side aggregation via Odoo's formatted_read_group."""
+
+    groups: List[Dict[str, Any]] = Field(
+        description=(
+            "Aggregated buckets. Each entry contains the groupby keys, '__count', "
+            "any requested aggregate values, and '__extra_domain' for drilldown."
+        )
+    )
+    model: str = Field(description="Odoo model name that was aggregated")
+    groupby: List[str] = Field(description="Group-by expressions that were applied")
+    aggregates: List[str] = Field(description="Aggregate expressions that were applied")
+
+
+# --- Call Model Method (XML-RPC execute_kw) ---
+
+
+class CallModelMethodResult(BaseModel):
+    """Result of invoking a public Odoo model method via XML-RPC execute_kw."""
+
+    success: bool = Field(description="Whether Odoo executed the method without RPC fault")
+    result: Any = Field(
+        default=None,
+        description="Return value from Odoo (type depends on the method; may be null)",
+    )
+    message: str = Field(description="Human-readable summary of the call")

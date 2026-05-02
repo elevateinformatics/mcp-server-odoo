@@ -413,12 +413,19 @@ class TestWriteToolsIntegration:
         """Posting a note to res.partner creates a mail.message linked to the record."""
         handler = real_tool_handler
 
+        # Plain-str → '&lt;' escape behavior is v17+ in mail.thread.message_post.
+        # On v16 the mail module strips text after '<' as if it were a tag.
+        # This test asserts on the modern behavior; skip on v16.
+        major = handler.connection.get_major_version()
+        if major is not None and major < 17:
+            pytest.skip(f"plain-str HTML escape is v17+; server is v{major}")
+
         # Use main_partner (always present) — we'll clean up the message afterwards
         partner_ids = handler.connection.search("res.partner", [], limit=1)
         assert partner_ids, "Need at least one res.partner for this test"
         partner_id = partner_ids[0]
 
-        # Body contains '<' so we can verify Odoo 19's plain-str escape behavior
+        # Body contains '<' so we can verify Odoo 17+'s plain-str escape behavior
         # (Odoo wraps any '<' in str body to '&lt;' when body_is_html is False).
         body = "MCP integration test: 5 < 10 & still works"
         result = await handler._handle_post_message_tool(
@@ -621,6 +628,173 @@ class TestWriteToolsIntegration:
                 handler.connection.unlink("mail.message", [message_id])
             except Exception:
                 pass
+
+
+class TestCallModelMethodIntegration:
+    """YOLO integration tests for the gated call_model_method tool.
+
+    Requires both ``ODOO_YOLO=true`` and ``ODOO_MCP_ENABLE_METHOD_CALLS=true``;
+    skipped otherwise. The tool is invisible to the client without the second
+    flag, so without it there is nothing to integration-test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_opt_in(self):
+        import os
+
+        if os.getenv("ODOO_MCP_ENABLE_METHOD_CALLS", "").strip().lower() != "true":
+            pytest.skip(
+                "Set ODOO_MCP_ENABLE_METHOD_CALLS=true (with ODOO_YOLO=true) "
+                "to run call_model_method integration tests."
+            )
+
+    @pytest.fixture
+    def real_config(self):
+        import os
+
+        from mcp_server_odoo.config import OdooConfig
+
+        return OdooConfig(
+            url=os.getenv("ODOO_URL", "http://localhost:8069"),
+            username=os.getenv("ODOO_USER", "admin"),
+            password=os.getenv("ODOO_PASSWORD", "admin"),
+            database=os.getenv("ODOO_DB"),
+            yolo_mode="true",
+            enable_method_calls=True,
+        )
+
+    @pytest.fixture
+    def real_connection(self, real_config):
+        from mcp_server_odoo.odoo_connection import OdooConnection
+
+        conn = OdooConnection(real_config)
+        conn.connect()
+        conn.authenticate()
+        yield conn
+        conn.disconnect()
+
+    @pytest.fixture
+    def real_access_controller(self, real_config):
+        from mcp_server_odoo.access_control import AccessController
+
+        return AccessController(real_config)
+
+    @pytest.fixture
+    def real_app(self):
+        from mcp.server.fastmcp import FastMCP
+
+        return FastMCP("test-app")
+
+    @pytest.fixture
+    def real_tool_handler(self, real_app, real_connection, real_access_controller, real_config):
+        return register_tools(real_app, real_connection, real_access_controller, real_config)
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_toggle_active_round_trip(self, real_tool_handler):
+        """Happy path: toggle_active flips res.partner.active; idempotent under double toggle."""
+        handler = real_tool_handler
+
+        create_result = await handler._handle_create_record_tool(
+            "res.partner", {"name": "MCP CallMethod Test", "is_company": False}
+        )
+        partner_id = create_result["record"]["id"]
+
+        try:
+            # First toggle: True -> False (do not assert toggle_active's return
+            # value; it varies across Odoo versions).
+            await handler._handle_call_model_method_tool(
+                "res.partner", "toggle_active", [[partner_id]], None
+            )
+            row = handler.connection.read("res.partner", [partner_id], ["active"])
+            assert row[0]["active"] is False, "expected partner deactivated"
+
+            # Second toggle: False -> True
+            await handler._handle_call_model_method_tool(
+                "res.partner", "toggle_active", [[partner_id]], None
+            )
+            row = handler.connection.read("res.partner", [partner_id], ["active"])
+            assert row[0]["active"] is True, "expected partner reactivated"
+        finally:
+            try:
+                handler.connection.unlink("res.partner", [partner_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_json_string_arguments_round_trip(self, real_tool_handler):
+        """JSON-string ``arguments`` form is parsed and reaches Odoo identically."""
+        handler = real_tool_handler
+
+        create_result = await handler._handle_create_record_tool(
+            "res.partner", {"name": "MCP CallMethod JSON-args"}
+        )
+        partner_id = create_result["record"]["id"]
+
+        try:
+            await handler._handle_call_model_method_tool(
+                "res.partner", "toggle_active", f"[[{partner_id}]]", None
+            )
+            row = handler.connection.read("res.partner", [partner_id], ["active"])
+            assert row[0]["active"] is False
+        finally:
+            try:
+                handler.connection.unlink("res.partner", [partner_id])
+            except Exception:
+                pass
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_kwargs_path_via_read_with_context(self, real_tool_handler):
+        """``keyword_arguments`` reach execute_kw — exercise via ``read`` (universal across 17/18/19)."""
+        handler = real_tool_handler
+
+        partner_ids = handler.connection.search("res.partner", [], limit=1)
+        if not partner_ids:
+            pytest.skip("Need at least one res.partner for this test")
+        partner_id = partner_ids[0]
+
+        result = await handler._handle_call_model_method_tool(
+            "res.partner",
+            "read",
+            [[partner_id], ["name"]],
+            {"context": {"lang": "en_US"}},
+        )
+
+        assert result["success"] is True
+        assert isinstance(result["result"], list) and result["result"], (
+            f"expected non-empty list of dicts, got {result['result']!r}"
+        )
+        assert "name" in result["result"][0]
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_private_method_rejected_live(self, real_tool_handler):
+        """``_compute_*`` is rejected before any RPC happens."""
+        from mcp_server_odoo.error_handling import ValidationError
+
+        handler = real_tool_handler
+        with pytest.raises(ValidationError, match="public ASCII Python identifiers"):
+            await handler._handle_call_model_method_tool(
+                "res.partner", "_compute_display_name", [[1]], None
+            )
+
+    @pytest.mark.yolo
+    @pytest.mark.asyncio
+    async def test_nonexistent_method_returns_validation_error(self, real_tool_handler):
+        """Unknown public method on a real model surfaces as a Connection error → ValidationError."""
+        from mcp_server_odoo.error_handling import ValidationError
+
+        handler = real_tool_handler
+        with pytest.raises(ValidationError) as exc_info:
+            await handler._handle_call_model_method_tool(
+                "res.partner", "definitely_does_not_exist", [[1]], None
+            )
+        # Either the OdooConnectionError → "Connection error" path or the
+        # generic sanitized "Failed to call model method" — accept both.
+        msg = str(exc_info.value)
+        assert "Connection error" in msg or "Failed to call model method" in msg
 
 
 class TestPostMessageMCPIntegration:

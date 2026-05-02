@@ -4,12 +4,15 @@ This module handles loading and validation of environment variables
 for connecting to Odoo via XML-RPC.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +42,9 @@ class OdooConfig:
 
     # YOLO mode configuration
     yolo_mode: str = "off"  # "off", "read", or "true"
+
+    # Opt-in for call_model_method (effective only with yolo_mode == "true").
+    enable_method_calls: bool = False
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -102,6 +108,14 @@ class OdooConfig:
         # Validate port
         if self.port <= 0 or self.port > 65535:
             raise ValueError("Port must be between 1 and 65535")
+
+        # Without this warning, the silent non-registration is hard to debug.
+        if self.enable_method_calls and self.yolo_mode != "true":
+            logger.warning(
+                "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored: requires ODOO_YOLO=true "
+                "(full YOLO mode); current yolo_mode=%r",
+                self.yolo_mode,
+            )
 
     @property
     def uses_api_key(self) -> bool:
@@ -204,6 +218,12 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         except ValueError:
             raise ValueError(f"{key} must be a valid integer") from None
 
+    def get_bool_env(key: str, default: bool = False) -> bool:
+        raw = os.getenv(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"true", "1", "yes"}
+
     # Helper function to parse YOLO mode
     def get_yolo_mode() -> str:
         yolo_env = os.getenv("ODOO_YOLO", "off").strip().lower()
@@ -234,6 +254,7 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         port=get_int_env("ODOO_MCP_PORT", 8000),
         locale=os.getenv("ODOO_LOCALE", "").strip() or None,
         yolo_mode=get_yolo_mode(),
+        enable_method_calls=get_bool_env("ODOO_MCP_ENABLE_METHOD_CALLS", False),
     )
 
     return config
