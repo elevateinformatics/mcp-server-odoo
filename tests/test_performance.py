@@ -301,6 +301,59 @@ class TestConnectionPool:
         assert stats["active_connections"] == 0
         assert stats["connections_closed"] == 2
 
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_each_proxy_gets_distinct_transport_http(self, mock_proxy, mock_config):
+        """Each ServerProxy must get its own transport instance."""
+        from mcp_server_odoo.performance import OdooTransport
+
+        mock_config.url = "http://localhost:8069"
+        pool = ConnectionPool(mock_config)
+
+        pool.get_connection("/xmlrpc/2/common")
+        pool.get_connection("/xmlrpc/2/object")
+
+        # Two distinct endpoints → two ServerProxy calls with distinct transports
+        assert mock_proxy.call_count == 2
+        t1 = mock_proxy.call_args_list[0].kwargs["transport"]
+        t2 = mock_proxy.call_args_list[1].kwargs["transport"]
+        assert t1 is not t2
+        assert isinstance(t1, OdooTransport)
+        assert isinstance(t2, OdooTransport)
+
+        # Same endpoint again → cache hit, no new ServerProxy created
+        pool.get_connection("/xmlrpc/2/common")
+        assert mock_proxy.call_count == 2
+
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_each_proxy_gets_distinct_transport_https(self, mock_proxy, mock_config):
+        """HTTPS scheme must produce distinct OdooSafeTransport per proxy."""
+        from mcp_server_odoo.performance import OdooSafeTransport
+
+        mock_config.url = "https://example.com"
+        pool = ConnectionPool(mock_config)
+
+        pool.get_connection("/xmlrpc/2/common")
+        pool.get_connection("/xmlrpc/2/object")
+
+        assert mock_proxy.call_count == 2
+        t1 = mock_proxy.call_args_list[0].kwargs["transport"]
+        t2 = mock_proxy.call_args_list[1].kwargs["transport"]
+        assert t1 is not t2
+        assert isinstance(t1, OdooSafeTransport)
+        assert isinstance(t2, OdooSafeTransport)
+
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_per_proxy_transport_inherits_database(self, mock_proxy, mock_config):
+        """After set_database, new proxies get transports with the new database."""
+        mock_config.url = "http://localhost:8069"
+        pool = ConnectionPool(mock_config)
+
+        pool.set_database("mydb")
+        pool.get_connection("/xmlrpc/2/object")
+
+        transport = mock_proxy.call_args_list[0].kwargs["transport"]
+        assert transport.database == "mydb"
+
 
 class TestRequestOptimizer:
     """Test RequestOptimizer functionality."""
