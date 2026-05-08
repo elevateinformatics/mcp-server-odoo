@@ -389,6 +389,7 @@ class OdooToolHandler:
             limit: int = 10,
             offset: int = 0,
             order: Optional[str] = None,
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Search for records in an Odoo model.
 
@@ -406,17 +407,21 @@ class OdooToolHandler:
                 limit: Maximum number of records to return
                 offset: Number of records to skip
                 order: Sort order (e.g., 'name asc')
+                lang: Optional one-shot language override (Odoo lang code,
+                    e.g. ``"es_AR"``). Translatable fields are returned in this
+                    language for this call only; the session locale is unchanged.
 
             Returns:
                 Dictionary with 'records' list and 'total' count
             """
-            return await self._handle_search_tool(model, domain, fields, limit, offset, order)
+            return await self._handle_search_tool(model, domain, fields, limit, offset, order, lang)
 
         @self.app.tool()
         async def get_record(
             model: str,
             record_id: int,
             fields: Optional[List[str]] = None,
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Get a specific record by ID with smart field selection.
 
@@ -430,6 +435,9 @@ class OdooToolHandler:
                     - None (default): Returns smart selection of common fields
                     - ["field1", "field2", ...]: Returns only specified fields
                     - ["__all__"]: Returns ALL fields (warning: can be very large)
+                lang: Optional one-shot language override (Odoo lang code,
+                    e.g. ``"es_AR"``). Translatable fields are returned in this
+                    language for this call only; the session locale is unchanged.
 
             Workflow for field discovery:
             1. To see all available fields for a model, use the resource:
@@ -451,13 +459,14 @@ class OdooToolHandler:
                 Dictionary with record data containing requested fields.
                 When using smart defaults, includes _metadata with field statistics.
             """
-            return await self._handle_get_record_tool(model, record_id, fields)
+            return await self._handle_get_record_tool(model, record_id, fields, lang)
 
         @self.app.tool()
         async def read_records(
             model: str,
             record_ids: List[int],
             fields: Optional[List[str]] = None,
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Read multiple records by their IDs in a single API call (batch operation).
 
@@ -469,6 +478,9 @@ class OdooToolHandler:
                 record_ids: List of record IDs to read
                 fields: Optional list of fields to return. If None, uses smart defaults.
                        Use ["__all__"] to get all fields.
+                lang: Optional one-shot language override (Odoo lang code,
+                    e.g. ``"es_AR"``). Translatable fields are returned in this
+                    language for this call only; the session locale is unchanged.
 
             Returns:
                 Dictionary with:
@@ -480,7 +492,7 @@ class OdooToolHandler:
                 # Read 50 specific partners in a single call
                 read_records("res.partner", [1, 2, 3, ...], ["name", "email"])
             """
-            return await self._handle_read_records_tool(model, record_ids, fields)
+            return await self._handle_read_records_tool(model, record_ids, fields, lang)
 
         @self.app.tool()
         async def list_models() -> Dict[str, Any]:
@@ -531,22 +543,29 @@ class OdooToolHandler:
         async def create_record(
             model: str,
             values: Dict[str, Any],
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Create a new record in an Odoo model.
 
             Args:
                 model: The Odoo model name (e.g., 'res.partner')
                 values: Field values for the new record
+                lang: Optional one-shot language override (Odoo lang code).
+                    Translatable values in ``values`` are stored under this
+                    language; other languages are filled with the same value
+                    by Odoo. Use ``update_field_translations`` afterwards if
+                    you need different values per language.
 
             Returns:
                 Dictionary with created record details
             """
-            return await self._handle_create_record_tool(model, values)
+            return await self._handle_create_record_tool(model, values, lang)
 
         @self.app.tool()
         async def create_records(
             model: str,
             records: List[Dict[str, Any]],
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Create multiple records in a single API call (batch operation).
 
@@ -571,13 +590,14 @@ class OdooToolHandler:
                     {"name": "Task 3", "project_id": 19}
                 ])
             """
-            return await self._handle_create_records_tool(model, records)
+            return await self._handle_create_records_tool(model, records, lang)
 
         @self.app.tool()
         async def update_record(
             model: str,
             record_id: int,
             values: Dict[str, Any],
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Update an existing record.
 
@@ -585,17 +605,23 @@ class OdooToolHandler:
                 model: The Odoo model name (e.g., 'res.partner')
                 record_id: The record ID to update
                 values: Field values to update
+                lang: Optional one-shot language override (Odoo lang code).
+                    Translatable values in ``values`` are stored under this
+                    language only — other languages remain unchanged. Use
+                    ``update_field_translations`` to write multiple languages
+                    in a single call.
 
             Returns:
                 Dictionary with updated record details
             """
-            return await self._handle_update_record_tool(model, record_id, values)
+            return await self._handle_update_record_tool(model, record_id, values, lang)
 
         @self.app.tool()
         async def update_records(
             model: str,
             record_ids: List[int],
             values: Dict[str, Any],
+            lang: Optional[str] = None,
         ) -> Dict[str, Any]:
             """Update multiple records with the same values (batch operation).
 
@@ -617,7 +643,7 @@ class OdooToolHandler:
                 # Update 85 tasks in a single call
                 update_records("project.task", [1, 2, 3, ...], {"display_in_project": True})
             """
-            return await self._handle_update_records_tool(model, record_ids, values)
+            return await self._handle_update_records_tool(model, record_ids, values, lang)
 
         @self.app.tool()
         async def delete_record(
@@ -635,6 +661,127 @@ class OdooToolHandler:
             """
             return await self._handle_delete_record_tool(model, record_id)
 
+        @self.app.tool()
+        async def get_locale() -> Dict[str, Any]:
+            """Return the current session locale and the languages installed in Odoo.
+
+            The session locale is the default language injected as ``context.lang``
+            on every Odoo call made by this MCP server. It is initialized from the
+            ``ODOO_LOCALE`` env var (if set) and can be changed at runtime with
+            ``set_locale``. Per-call ``lang`` parameters on other tools take
+            precedence and do not modify the session locale.
+
+            Returns:
+                Dictionary with:
+                - session_locale: Current session lang code (or None if Odoo
+                  should fall back to the authenticated user's language).
+                - installed_languages: List of active languages in the database
+                  (each with ``code``, ``name``, ``iso_code``, ``active``).
+            """
+            return await self._handle_get_locale_tool()
+
+        @self.app.tool()
+        async def set_locale(lang: Optional[str] = None) -> Dict[str, Any]:
+            """Set or clear the session locale used as default ``context.lang``.
+
+            Args:
+                lang: Odoo lang code to use as the new default (e.g. ``"es_AR"``,
+                    ``"en_US"``, ``"fr_FR"``). Pass an empty string or ``null``
+                    to clear it; Odoo will then fall back to the authenticated
+                    user's language for subsequent calls.
+
+            Returns:
+                Dictionary with:
+                - previous_locale: Previous session locale (or None).
+                - session_locale: New session locale (or None).
+                - validated: True if the lang code matches an installed language
+                  in Odoo. False (with a warning) if it could not be verified.
+            """
+            return await self._handle_set_locale_tool(lang)
+
+        @self.app.tool()
+        async def get_field_translations(
+            model: str,
+            record_ids: List[int],
+            field_names: List[str],
+            langs: Optional[List[str]] = None,
+        ) -> Dict[str, Any]:
+            """Read all translations of one or more translatable fields.
+
+            Returns the per-language values stored in Odoo's jsonb translation
+            storage, regardless of the current session locale. Use this when you
+            need to inspect or export multilingual content (product names,
+            mail templates, view ``arch_db``, etc.).
+
+            Args:
+                model: The Odoo model name (e.g. ``"product.template"``).
+                record_ids: List of record IDs to inspect.
+                field_names: Translatable fields to read.
+                langs: Optional list of Odoo lang codes to restrict the result.
+                    ``None`` returns every installed language.
+
+            Returns:
+                Dictionary shaped as::
+
+                    {
+                      "model": "product.template",
+                      "translations": {
+                        "<record_id>": {
+                          "<field>": [
+                            {"lang": "en_US", "source": "...", "value": "..."},
+                            {"lang": "es_AR", "source": "...", "value": "..."}
+                          ]
+                        }
+                      }
+                    }
+
+                For term-based fields (``arch_db``, qweb HTML), each language
+                yields one entry per source-term pair instead of a single
+                ``source/value`` pair.
+            """
+            return await self._handle_get_field_translations_tool(
+                model, record_ids, field_names, langs
+            )
+
+        @self.app.tool()
+        async def update_field_translations(
+            model: str,
+            record_ids: List[int],
+            translations: Dict[str, Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            """Write translations for multiple languages at once.
+
+            Bypasses ``context.lang`` and writes directly into the jsonb storage
+            via Odoo's ``update_field_translations`` API. Works for any
+            ``translate=True`` field, including ``ir.ui.view.arch_db`` and qweb
+            templates. Languages not present in the payload are left untouched.
+
+            Args:
+                model: The Odoo model name.
+                record_ids: List of record IDs to update.
+                translations: Mapping of field -> {lang_code: value}. For plain
+                    translatable fields, ``value`` is the translated string. For
+                    term-based fields like ``arch_db`` it is a dict mapping
+                    source term -> translated term.
+
+            Example:
+                update_field_translations(
+                    "product.template",
+                    [42],
+                    {
+                        "name": {"en_US": "Sofa", "es_AR": "Sofá", "fr_FR": "Canapé"},
+                        "description_sale": {"en_US": "...", "es_AR": "..."}
+                    }
+                )
+
+            Returns:
+                Dictionary with success flag and the list of updated field/lang
+                pairs.
+            """
+            return await self._handle_update_field_translations_tool(
+                model, record_ids, translations
+            )
+
     async def _handle_search_tool(
         self,
         model: str,
@@ -643,6 +790,7 @@ class OdooToolHandler:
         limit: int,
         offset: int,
         order: Optional[str],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle search tool request."""
         try:
@@ -723,13 +871,23 @@ class OdooToolHandler:
                 if limit <= 0 or limit > self.config.max_limit:
                     limit = self.config.default_limit
 
-                # Get total count
-                total_count = self.connection.search_count(model, parsed_domain)
-
-                # Search for records
-                record_ids = self.connection.search(
-                    model, parsed_domain, limit=limit, offset=offset, order=order
-                )
+                # Get total count (only thread ``lang`` through when set so mocks
+                # asserting on plain (model, domain) still match).
+                if lang:
+                    total_count = self.connection.search_count(model, parsed_domain, lang=lang)
+                    record_ids = self.connection.search(
+                        model,
+                        parsed_domain,
+                        lang=lang,
+                        limit=limit,
+                        offset=offset,
+                        order=order,
+                    )
+                else:
+                    total_count = self.connection.search_count(model, parsed_domain)
+                    record_ids = self.connection.search(
+                        model, parsed_domain, limit=limit, offset=offset, order=order
+                    )
 
                 # Determine which fields to fetch
                 fields_to_fetch = parsed_fields
@@ -747,7 +905,12 @@ class OdooToolHandler:
                 # Read records
                 records = []
                 if record_ids:
-                    records = self.connection.read(model, record_ids, fields_to_fetch)
+                    if lang:
+                        records = self.connection.read(
+                            model, record_ids, fields_to_fetch, lang=lang
+                        )
+                    else:
+                        records = self.connection.read(model, record_ids, fields_to_fetch)
                     # Process datetime fields in each record
                     records = [self._process_record_dates(record, model) for record in records]
 
@@ -773,6 +936,7 @@ class OdooToolHandler:
         model: str,
         record_id: int,
         fields: Optional[List[str]],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle get record tool request."""
         try:
@@ -805,7 +969,10 @@ class OdooToolHandler:
                     logger.debug(f"Fetching specific fields for {model}: {fields}")
 
                 # Read the record
-                records = self.connection.read(model, [record_id], fields_to_fetch)
+                if lang:
+                    records = self.connection.read(model, [record_id], fields_to_fetch, lang=lang)
+                else:
+                    records = self.connection.read(model, [record_id], fields_to_fetch)
 
                 if not records:
                     raise ToolError(f"Record not found: {model} with ID {record_id}")
@@ -855,6 +1022,7 @@ class OdooToolHandler:
         model: str,
         record_ids: List[int],
         fields: Optional[List[str]],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle read records (batch) tool request."""
         try:
@@ -885,7 +1053,10 @@ class OdooToolHandler:
                     logger.debug(f"Fetching all fields for {model} batch read")
 
                 # Read records (single API call)
-                records = self.connection.read(model, record_ids, fields_to_fetch)
+                if lang:
+                    records = self.connection.read(model, record_ids, fields_to_fetch, lang=lang)
+                else:
+                    records = self.connection.read(model, record_ids, fields_to_fetch)
 
                 # Process datetime fields in each record
                 records = [self._process_record_dates(record, model) for record in records]
@@ -1118,6 +1289,7 @@ class OdooToolHandler:
         self,
         model: str,
         values: Dict[str, Any],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle create record tool request."""
         try:
@@ -1134,7 +1306,10 @@ class OdooToolHandler:
                     raise ValidationError("No values provided for record creation")
 
                 # Create the record
-                record_id = self.connection.create(model, values)
+                if lang:
+                    record_id = self.connection.create(model, values, lang=lang)
+                else:
+                    record_id = self.connection.create(model, values)
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
@@ -1177,6 +1352,7 @@ class OdooToolHandler:
         self,
         model: str,
         records: List[Dict[str, Any]],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle create records (batch) tool request."""
         try:
@@ -1203,7 +1379,10 @@ class OdooToolHandler:
 
                 # Create all records in a single API call
                 # Odoo's create method accepts a list of dicts and returns a list of IDs
-                record_ids = self.connection.create(model, records)
+                if lang:
+                    record_ids = self.connection.create(model, records, lang=lang)
+                else:
+                    record_ids = self.connection.create(model, records)
 
                 # Handle single ID return (when only one record was created)
                 if isinstance(record_ids, int):
@@ -1241,6 +1420,7 @@ class OdooToolHandler:
         model: str,
         record_id: int,
         values: Dict[str, Any],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle update record tool request."""
         try:
@@ -1262,7 +1442,10 @@ class OdooToolHandler:
                     raise NotFoundError(f"Record not found: {model} with ID {record_id}")
 
                 # Update the record
-                success = self.connection.write(model, [record_id], values)
+                if lang:
+                    success = self.connection.write(model, [record_id], values, lang=lang)
+                else:
+                    success = self.connection.write(model, [record_id], values)
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
@@ -1308,6 +1491,7 @@ class OdooToolHandler:
         model: str,
         record_ids: List[int],
         values: Dict[str, Any],
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Handle update records (batch) tool request."""
         try:
@@ -1337,7 +1521,10 @@ class OdooToolHandler:
                     )
 
                 # Perform batch update (single API call)
-                success = self.connection.write(model, record_ids, values)
+                if lang:
+                    success = self.connection.write(model, record_ids, values, lang=lang)
+                else:
+                    success = self.connection.write(model, record_ids, values)
 
                 return {
                     "success": success,
@@ -1356,6 +1543,192 @@ class OdooToolHandler:
             logger.error(f"Error in update_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ToolError(f"Failed to update records: {sanitized_msg}") from e
+
+    async def _handle_get_locale_tool(self) -> Dict[str, Any]:
+        """Handle get_locale tool request."""
+        try:
+            with perf_logger.track_operation("tool_get_locale"):
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                installed: List[Dict[str, Any]] = []
+                try:
+                    installed = self.connection.list_installed_languages()
+                except Exception as e:
+                    logger.warning(f"Could not list installed languages: {e}")
+
+                return {
+                    "session_locale": self.connection.get_session_locale(),
+                    "installed_languages": installed,
+                }
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in get_locale tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to get locale: {sanitized_msg}") from e
+
+    async def _handle_set_locale_tool(self, lang: Optional[str]) -> Dict[str, Any]:
+        """Handle set_locale tool request."""
+        try:
+            with perf_logger.track_operation("tool_set_locale"):
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                previous = self.connection.get_session_locale()
+                normalized = lang.strip() if isinstance(lang, str) and lang.strip() else None
+
+                # Validate against installed languages when a lang is requested.
+                # Failure to validate (e.g. perms on res.lang) is non-fatal — we
+                # still set the locale but flag validated=False.
+                validated = False
+                installed_codes: List[str] = []
+                if normalized is not None:
+                    try:
+                        languages = self.connection.list_installed_languages()
+                        installed_codes = [lng["code"] for lng in languages if lng.get("code")]
+                        validated = normalized in installed_codes
+                        if not validated:
+                            raise ValidationError(
+                                f"Language code '{normalized}' is not installed in Odoo. "
+                                f"Installed: {', '.join(installed_codes) or '(none queryable)'}"
+                            )
+                    except ValidationError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not validate lang '{normalized}' against res.lang: {e}"
+                        )
+
+                new_locale = self.connection.set_session_locale(normalized)
+
+                return {
+                    "previous_locale": previous,
+                    "session_locale": new_locale,
+                    "validated": validated,
+                    "message": (
+                        f"Session locale cleared (was {previous!r})"
+                        if new_locale is None
+                        else f"Session locale set to {new_locale!r} (was {previous!r})"
+                    ),
+                }
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in set_locale tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to set locale: {sanitized_msg}") from e
+
+    async def _handle_get_field_translations_tool(
+        self,
+        model: str,
+        record_ids: List[int],
+        field_names: List[str],
+        langs: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        """Handle get_field_translations tool request."""
+        try:
+            with perf_logger.track_operation("tool_get_field_translations", model=model):
+                self.access_controller.validate_model_access(model, "read")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+                if not record_ids:
+                    raise ValidationError("No record IDs provided")
+                if not field_names:
+                    raise ValidationError("No field names provided")
+
+                translations: Dict[int, Dict[str, Any]] = {rid: {} for rid in record_ids}
+                for field_name in field_names:
+                    per_record = self.connection.get_field_translations(
+                        model, record_ids, field_name, langs
+                    )
+                    for rid, payload in per_record.items():
+                        translations.setdefault(rid, {})[field_name] = payload
+
+                return {
+                    "model": model,
+                    "record_ids": record_ids,
+                    "field_names": field_names,
+                    "langs": langs,
+                    # JSON-friendly: stringify int keys
+                    "translations": {str(rid): data for rid, data in translations.items()},
+                }
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in get_field_translations tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to get field translations: {sanitized_msg}") from e
+
+    async def _handle_update_field_translations_tool(
+        self,
+        model: str,
+        record_ids: List[int],
+        translations: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Handle update_field_translations tool request."""
+        try:
+            with perf_logger.track_operation("tool_update_field_translations", model=model):
+                self.access_controller.validate_model_access(model, "write")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+                if not record_ids:
+                    raise ValidationError("No record IDs provided")
+                if not translations or not isinstance(translations, dict):
+                    raise ValidationError(
+                        "translations must be a non-empty dict of field -> {lang: value}"
+                    )
+
+                # Verify records exist
+                existing = self.connection.read(model, record_ids, ["id"])
+                existing_ids = {record["id"] for record in existing}
+                missing = sorted(set(record_ids) - existing_ids)
+                if missing:
+                    raise NotFoundError(f"Records not found: {model} with IDs {missing}")
+
+                applied: List[Dict[str, Any]] = []
+                for field_name, per_lang in translations.items():
+                    if not isinstance(per_lang, dict) or not per_lang:
+                        raise ValidationError(
+                            f"Translations for '{field_name}' must be a non-empty "
+                            "{lang_code: value} dict"
+                        )
+                    applied.append({"field": field_name, "langs": sorted(per_lang.keys())})
+
+                success = self.connection.update_field_translations(model, record_ids, translations)
+
+                return {
+                    "success": bool(success),
+                    "model": model,
+                    "record_ids": record_ids,
+                    "applied": applied,
+                    "message": (
+                        f"Updated translations for {len(applied)} field(s) on "
+                        f"{len(record_ids)} {model} record(s)"
+                    ),
+                }
+        except ValidationError:
+            raise
+        except NotFoundError as e:
+            raise ToolError(str(e)) from e
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in update_field_translations tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to update field translations: {sanitized_msg}") from e
 
     async def _handle_delete_record_tool(
         self,

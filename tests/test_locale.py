@@ -193,3 +193,201 @@ class TestLocaleSupport:
                 yolo_mode="true",
             )
             assert config.locale == locale_code
+
+
+def _bootstrap_authenticated_connection(config: OdooConfig) -> tuple:
+    """Build a fake authenticated connection wired to a mock proxy."""
+    conn = OdooConnection(config)
+    conn._connected = True
+    conn._authenticated = True
+    conn._uid = 1
+    conn._database = "test_db"
+    conn._auth_method = "api_key"
+
+    mock_proxy = MagicMock()
+    mock_proxy.execute_kw.return_value = []
+    conn._object_proxy = mock_proxy
+    return conn, mock_proxy
+
+
+class TestPerCallLangOverride:
+    """Per-call ``lang`` parameter takes precedence over session locale."""
+
+    def _config(self, locale: str = "es_ES") -> OdooConfig:
+        return OdooConfig(
+            url="https://test.odoo.com",
+            api_key="test_key",
+            username="test",
+            database="test_db",
+            locale=locale,
+            yolo_mode="true",
+        )
+
+    def test_caller_provided_lang_in_context_is_respected(self):
+        """If the caller passed ``context.lang`` directly, it must NOT be overwritten."""
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+
+        kwargs = {"context": {"lang": "fr_FR"}}
+        conn.execute_kw("res.partner", "search", [[]], kwargs)
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "fr_FR"
+
+    def test_read_lang_param_overrides_session(self):
+        """``OdooConnection.read(lang=...)`` overrides the session locale for one call."""
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        mock_proxy.execute_kw.return_value = [{"id": 7, "name": "Hi"}]
+
+        conn.read("res.partner", [7], ["name"], lang="en_US")
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "en_US"
+
+    def test_search_read_lang_param_overrides_session(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+
+        conn.search_read("res.partner", [], lang="fr_FR")
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "fr_FR"
+
+    def test_write_lang_param_overrides_session(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        mock_proxy.execute_kw.return_value = True
+
+        conn.write("res.partner", [1], {"name": "Foo"}, lang="en_US")
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "en_US"
+
+    def test_create_lang_param_overrides_session(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        mock_proxy.execute_kw.return_value = 42
+
+        conn.create("res.partner", {"name": "Foo"}, lang="en_US")
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "en_US"
+
+    def test_no_lang_param_falls_back_to_session_locale(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        mock_proxy.execute_kw.return_value = [{"id": 1, "name": "Hi"}]
+
+        conn.read("res.partner", [1], ["name"])
+
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "es_ES"
+
+
+class TestSessionLocale:
+    """Mutable per-session locale state."""
+
+    def _config(self, locale=None) -> OdooConfig:
+        return OdooConfig(
+            url="https://test.odoo.com",
+            api_key="test_key",
+            username="test",
+            database="test_db",
+            locale=locale,
+            yolo_mode="true",
+        )
+
+    def test_session_locale_initialized_from_config(self):
+        conn = OdooConnection(self._config(locale="es_ES"))
+        assert conn.get_session_locale() == "es_ES"
+
+    def test_session_locale_none_when_not_configured(self):
+        conn = OdooConnection(self._config(locale=None))
+        assert conn.get_session_locale() is None
+
+    def test_set_session_locale_changes_subsequent_calls(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        conn.set_session_locale("fr_FR")
+
+        conn.execute_kw("res.partner", "search", [[]], {})
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        assert passed_kwargs["context"]["lang"] == "fr_FR"
+
+    def test_set_session_locale_clears_when_none(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config("es_ES"))
+        conn.set_session_locale(None)
+
+        conn.execute_kw("res.partner", "search", [[]], {})
+        passed_kwargs = mock_proxy.execute_kw.call_args[0][6]
+        # No lang should be injected
+        if "context" in passed_kwargs:
+            assert "lang" not in passed_kwargs["context"]
+
+    def test_set_session_locale_clears_when_empty_string(self):
+        conn, _ = _bootstrap_authenticated_connection(self._config("es_ES"))
+        conn.set_session_locale("   ")
+        assert conn.get_session_locale() is None
+
+
+class TestTranslationHelpers:
+    """``get_field_translations`` / ``update_field_translations`` wrappers."""
+
+    def _config(self) -> OdooConfig:
+        return OdooConfig(
+            url="https://test.odoo.com",
+            api_key="test_key",
+            username="test",
+            database="test_db",
+            yolo_mode="true",
+        )
+
+    def test_get_field_translations_returns_per_record_payload(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config())
+        mock_proxy.execute_kw.return_value = [
+            [
+                {"lang": "en_US", "source": "Sofa", "value": "Sofa"},
+                {"lang": "es_AR", "source": "Sofa", "value": "Sofá"},
+            ],
+            {"translated_field": {"string": "Name"}},
+        ]
+
+        result = conn.get_field_translations("product.template", [42], "name")
+
+        assert 42 in result
+        # Field metadata (second tuple element) is dropped
+        assert isinstance(result[42], list)
+        assert {entry["lang"] for entry in result[42]} == {"en_US", "es_AR"}
+
+    def test_get_field_translations_passes_langs_filter(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config())
+        mock_proxy.execute_kw.return_value = [
+            [{"lang": "es_AR", "source": "Sofa", "value": "Sofá"}],
+            {},
+        ]
+
+        conn.get_field_translations("product.template", [42], "name", langs=["es_AR"])
+
+        # Verify langs forwarded as kwargs to Odoo's get_field_translations
+        call_args = mock_proxy.execute_kw.call_args
+        passed_kwargs = call_args[0][6]
+        assert passed_kwargs.get("langs") == ["es_AR"]
+
+    def test_update_field_translations_calls_per_field(self):
+        conn, mock_proxy = _bootstrap_authenticated_connection(self._config())
+        mock_proxy.execute_kw.return_value = True
+
+        ok = conn.update_field_translations(
+            "product.template",
+            [42],
+            {
+                "name": {"en_US": "Sofa", "es_AR": "Sofá"},
+                "description_sale": {"en_US": "x", "es_AR": "y"},
+            },
+        )
+
+        assert ok is True
+        # One call per translated field
+        assert mock_proxy.execute_kw.call_count == 2
+        methods = [call.args[4] for call in mock_proxy.execute_kw.call_args_list]
+        assert methods == ["update_field_translations", "update_field_translations"]
+
+    def test_update_field_translations_rejects_non_dict_payload(self):
+        conn, _ = _bootstrap_authenticated_connection(self._config())
+
+        with pytest.raises(Exception):
+            conn.update_field_translations("product.template", [42], {"name": "not-a-dict"})

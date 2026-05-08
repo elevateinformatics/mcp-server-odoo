@@ -109,6 +109,11 @@ class OdooConnection:
         self._authenticated = False
         self._auth_method: Optional[str] = None  # 'api_key' or 'password'
 
+        # Mutable session locale (initialized from config, changeable at runtime
+        # via set_session_locale). Used to inject context.lang on execute_kw calls
+        # unless the caller already provided one.
+        self._session_locale: Optional[str] = config.locale
+
         mode_info = f" (YOLO mode: {config.yolo_mode})" if config.is_yolo_enabled else ""
         logger.info(f"Initialized OdooConnection for {self._url_components['host']}{mode_info}")
 
@@ -913,13 +918,18 @@ class OdooConnection:
             self.config.api_key if self._auth_method == "api_key" else self.config.password
         )
 
-        # Inject locale into context if configured
-        if self.config.locale:
-            if "context" not in kwargs:
+        # Inject session locale into context unless the caller already set one.
+        # This preserves per-call lang overrides (e.g. for editing translations)
+        # while still using the session default for everything else.
+        existing_context = kwargs.get("context") or {}
+        caller_lang = existing_context.get("lang") if isinstance(existing_context, dict) else None
+        if caller_lang:
+            logger.debug(f"🌍 Per-call lang override: {caller_lang}")
+        elif self._session_locale:
+            if "context" not in kwargs or kwargs["context"] is None:
                 kwargs["context"] = {}
-            # Set language in Odoo context
-            kwargs["context"]["lang"] = self.config.locale
-            logger.info(f"🌍 Locale injected: {self.config.locale}")
+            kwargs["context"]["lang"] = self._session_locale
+            logger.debug(f"🌍 Session locale injected: {self._session_locale}")
 
         last_error: Optional[Exception] = None
 
@@ -993,21 +1003,47 @@ class OdooConnection:
                 f"Operation failed after {self.MAX_RETRIES + 1} attempts: {sanitized_message}"
             )
 
-    def search(self, model: str, domain: List[Union[str, List[Any]]], **kwargs) -> List[int]:
+    @staticmethod
+    def _inject_lang(kwargs: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
+        """Inject ``lang`` into the kwargs ``context`` dict if provided.
+
+        Returns the same kwargs dict (mutated) for chaining convenience.
+        """
+        if lang:
+            ctx = kwargs.get("context")
+            if not isinstance(ctx, dict):
+                ctx = {}
+            ctx = {**ctx, "lang": lang}
+            kwargs["context"] = ctx
+        return kwargs
+
+    def search(
+        self,
+        model: str,
+        domain: List[Union[str, List[Any]]],
+        lang: Optional[str] = None,
+        **kwargs,
+    ) -> List[int]:
         """Search for records matching a domain.
 
         Args:
             model: The Odoo model name
             domain: Odoo domain filter (e.g., [['is_company', '=', True]])
+            lang: Optional one-shot language override (Odoo lang code, e.g. ``es_AR``)
             **kwargs: Additional parameters (limit, offset, order)
 
         Returns:
             List of record IDs matching the domain
         """
+        self._inject_lang(kwargs, lang)
         return self.execute_kw(model, "search", [domain], kwargs)
 
     def read(
-        self, model: str, ids: List[int], fields: Optional[List[str]] = None
+        self,
+        model: str,
+        ids: List[int],
+        fields: Optional[List[str]] = None,
+        lang: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Read records by IDs.
 
@@ -1015,37 +1051,47 @@ class OdooConnection:
             model: The Odoo model name
             ids: List of record IDs to read
             fields: List of field names to read (None for all fields)
+            lang: Optional one-shot language override (Odoo lang code, e.g. ``es_AR``)
 
         Returns:
             List of dictionaries containing record data
         """
-        # Try to get cached records
-        cached_records = []
-        uncached_ids = []
+        # Cache is keyed per (model, id, fields) and does not currently track
+        # the language used. Skip cache for explicit per-call lang overrides
+        # so we never serve a record translated for a different language.
+        use_cache = lang is None
+        cached_records: List[Dict[str, Any]] = []
+        uncached_ids: List[int] = list(ids)
 
-        for record_id in ids:
-            cached = self._performance_manager.get_cached_record(model, record_id, fields)
-            if cached:
-                cached_records.append(cached)
-            else:
-                uncached_ids.append(record_id)
+        if use_cache:
+            cached_records = []
+            uncached_ids = []
+            for record_id in ids:
+                cached = self._performance_manager.get_cached_record(model, record_id, fields)
+                if cached:
+                    cached_records.append(cached)
+                else:
+                    uncached_ids.append(record_id)
 
-        # If all records are cached, return them
-        if not uncached_ids:
-            logger.debug(f"All {len(ids)} records retrieved from cache")
-            return cached_records
+            # If all records are cached, return them
+            if not uncached_ids:
+                logger.debug(f"All {len(ids)} records retrieved from cache")
+                return cached_records
 
         # Read uncached records
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if fields:
             kwargs["fields"] = fields
+        self._inject_lang(kwargs, lang)
 
         with self._performance_manager.monitor.track_operation(f"read_{model}"):
             new_records = self.execute_kw(model, "read", [uncached_ids], kwargs)
 
-        # Cache the new records
-        for record in new_records:
-            self._performance_manager.cache_record(model, record, fields)
+        # Cache the new records (skip when lang override is in play to avoid
+        # poisoning the cache with translated values).
+        if use_cache:
+            for record in new_records:
+                self._performance_manager.cache_record(model, record, fields)
 
         # Combine cached and new records in original order
         all_records = cached_records + new_records
@@ -1060,6 +1106,7 @@ class OdooConnection:
         model: str,
         domain: List[Union[str, List[Any]]],
         fields: Optional[List[str]] = None,
+        lang: Optional[str] = None,
         **kwargs,
     ) -> List[Dict[str, Any]]:
         """Search for records and read their data in one operation.
@@ -1068,6 +1115,7 @@ class OdooConnection:
             model: The Odoo model name
             domain: Odoo domain filter
             fields: List of field names to read (None for all fields)
+            lang: Optional one-shot language override (Odoo lang code, e.g. ``es_AR``)
             **kwargs: Additional parameters (limit, offset, order)
 
         Returns:
@@ -1075,54 +1123,78 @@ class OdooConnection:
         """
         if fields:
             kwargs["fields"] = fields
+        self._inject_lang(kwargs, lang)
         return self.execute_kw(model, "search_read", [domain], kwargs)
 
     def fields_get(
-        self, model: str, attributes: Optional[List[str]] = None
+        self,
+        model: str,
+        attributes: Optional[List[str]] = None,
+        lang: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Get field definitions for a model.
 
         Args:
             model: The Odoo model name
             attributes: List of field attributes to return
+            lang: Optional one-shot language override (Odoo lang code, e.g. ``es_AR``).
+                When provided, cache is bypassed since field labels (``string``,
+                ``help``) are translatable.
 
         Returns:
             Dictionary mapping field names to their definitions
         """
-        # Check cache first
-        cached_fields = self._performance_manager.get_cached_fields(model)
-        if cached_fields and not attributes:  # Only use cache if no specific attributes requested
-            logger.debug(f"Field definitions for {model} retrieved from cache")
-            return cached_fields
+        # Check cache first (only when no per-call lang override and no attributes filter)
+        use_cache = lang is None
+        if use_cache:
+            cached_fields = self._performance_manager.get_cached_fields(model)
+            if (
+                cached_fields and not attributes
+            ):  # Only use cache if no specific attributes requested
+                logger.debug(f"Field definitions for {model} retrieved from cache")
+                return cached_fields
 
         # Get fields from server
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if attributes:
             kwargs["attributes"] = attributes
+        self._inject_lang(kwargs, lang)
 
         with self._performance_manager.monitor.track_operation(f"fields_get_{model}"):
             fields = self.execute_kw(model, "fields_get", [], kwargs)
 
-        # Cache if we got all attributes
-        if not attributes:
+        # Cache if we got all attributes and no lang override
+        if use_cache and not attributes:
             self._performance_manager.cache_fields(model, fields)
 
         return fields
 
-    def search_count(self, model: str, domain: List[Union[str, List[Any]]]) -> int:
+    def search_count(
+        self,
+        model: str,
+        domain: List[Union[str, List[Any]]],
+        lang: Optional[str] = None,
+    ) -> int:
         """Count records matching a domain.
 
         Args:
             model: The Odoo model name
             domain: Odoo domain filter
+            lang: Optional one-shot language override. Only useful when the
+                domain filters on translatable fields.
 
         Returns:
             Number of records matching the domain
         """
-        return self.execute_kw(model, "search_count", [domain], {})
+        kwargs: Dict[str, Any] = {}
+        self._inject_lang(kwargs, lang)
+        return self.execute_kw(model, "search_count", [domain], kwargs)
 
     def create(
-        self, model: str, values: Union[Dict[str, Any], List[Dict[str, Any]]]
+        self,
+        model: str,
+        values: Union[Dict[str, Any], List[Dict[str, Any]]],
+        lang: Optional[str] = None,
     ) -> Union[int, List[int]]:
         """Create one or more records.
 
@@ -1130,6 +1202,8 @@ class OdooConnection:
             model: The Odoo model name
             values: Dictionary of field values for a single record,
                    or a list of dictionaries for batch creation
+            lang: Optional one-shot language override. Translatable values
+                provided in ``values`` will be stored under this language.
 
         Returns:
             ID of the created record (int) for single creation,
@@ -1140,7 +1214,9 @@ class OdooConnection:
         """
         try:
             with self._performance_manager.monitor.track_operation(f"create_{model}"):
-                result = self.execute_kw(model, "create", [values], {})
+                kwargs: Dict[str, Any] = {}
+                self._inject_lang(kwargs, lang)
+                result = self.execute_kw(model, "create", [values], kwargs)
                 # Invalidate cache for this model
                 self._performance_manager.invalidate_record_cache(model)
                 if isinstance(values, list):
@@ -1152,13 +1228,22 @@ class OdooConnection:
             logger.error(f"Failed to create {model} record(s): {e}")
             raise
 
-    def write(self, model: str, ids: List[int], values: Dict[str, Any]) -> bool:
+    def write(
+        self,
+        model: str,
+        ids: List[int],
+        values: Dict[str, Any],
+        lang: Optional[str] = None,
+    ) -> bool:
         """Update existing records.
 
         Args:
             model: The Odoo model name
             ids: List of record IDs to update
             values: Dictionary of field values to update
+            lang: Optional one-shot language override. Translatable values
+                provided in ``values`` will be stored under this language;
+                other languages remain untouched.
 
         Returns:
             True if update was successful
@@ -1168,7 +1253,9 @@ class OdooConnection:
         """
         try:
             with self._performance_manager.monitor.track_operation(f"write_{model}"):
-                result = self.execute_kw(model, "write", [ids, values], {})
+                kwargs: Dict[str, Any] = {}
+                self._inject_lang(kwargs, lang)
+                result = self.execute_kw(model, "write", [ids, values], kwargs)
                 # Invalidate cache for updated records
                 for record_id in ids:
                     self._performance_manager.invalidate_record_cache(model, record_id)
@@ -1202,6 +1289,139 @@ class OdooConnection:
         except Exception as e:
             logger.error(f"Failed to delete {model} records: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Session locale + translations
+    # ------------------------------------------------------------------
+
+    def get_session_locale(self) -> Optional[str]:
+        """Return the current session locale (Odoo lang code), if any."""
+        return self._session_locale
+
+    def set_session_locale(self, lang: Optional[str]) -> Optional[str]:
+        """Set (or clear) the session locale used as default ``context.lang``.
+
+        Args:
+            lang: Odoo lang code (e.g. ``"es_AR"``, ``"en_US"``). Pass ``None``
+                or empty string to clear the session locale, in which case
+                Odoo will fall back to the authenticated user's language.
+
+        Returns:
+            The new session locale (or ``None`` if cleared).
+        """
+        normalized = lang.strip() if isinstance(lang, str) and lang.strip() else None
+        previous = self._session_locale
+        self._session_locale = normalized
+        # Locale changes invalidate every cached record/field (none are keyed by lang).
+        self._performance_manager.clear_all_caches()
+        logger.info(f"🌍 Session locale changed: {previous!r} -> {normalized!r}")
+        return self._session_locale
+
+    def list_installed_languages(self) -> List[Dict[str, Any]]:
+        """Return active languages installed in the Odoo database.
+
+        Returns:
+            List of dicts with ``code``, ``name``, ``iso_code`` and ``active``.
+        """
+        return self.execute_kw(
+            "res.lang",
+            "search_read",
+            [[("active", "=", True)]],
+            {"fields": ["code", "name", "iso_code", "active"], "order": "code"},
+        )
+
+    def get_field_translations(
+        self,
+        model: str,
+        ids: List[int],
+        field_name: str,
+        langs: Optional[List[str]] = None,
+    ) -> Dict[int, Any]:
+        """Read translations of a field for given record IDs.
+
+        Wraps Odoo's ``get_field_translations(field_name, langs=None)`` recordset
+        method and returns a per-record mapping. The shape of each record's
+        translations depends on the field type:
+
+        * Simple translatable fields (``name``, ``description_sale``, ...):
+          ``[{"lang": "en_US", "source": "...", "value": "..."}, ...]``
+        * Term-based fields (``arch_db``, qweb HTML, ...): the same list, but
+          one entry per (lang, source-term) pair.
+
+        Args:
+            model: The Odoo model name (e.g. ``"product.template"``).
+            ids: List of record IDs.
+            field_name: Translatable field to inspect.
+            langs: Optional list of Odoo lang codes to restrict the result.
+                ``None`` means "all installed languages".
+
+        Returns:
+            Dictionary keyed by record ID. Each value is the first element
+            returned by Odoo (the list of per-language entries). The second
+            element returned by Odoo (field metadata) is dropped because it
+            is identical for every record.
+        """
+        if not ids:
+            return {}
+
+        result: Dict[int, Any] = {}
+        for record_id in ids:
+            args: List[Any] = [[record_id], field_name]
+            kwargs: Dict[str, Any] = {}
+            if langs:
+                kwargs["langs"] = langs
+            raw = self.execute_kw(model, "get_field_translations", args, kwargs)
+            # Odoo returns a tuple/list: (translations, field_info)
+            if isinstance(raw, (list, tuple)) and len(raw) >= 1:
+                result[record_id] = raw[0]
+            else:
+                result[record_id] = raw
+        return result
+
+    def update_field_translations(
+        self,
+        model: str,
+        ids: List[int],
+        translations: Dict[str, Dict[str, Any]],
+    ) -> bool:
+        """Write translations directly to the jsonb storage of translatable fields.
+
+        Wraps Odoo's ``update_field_translations(field_name, translations)``
+        recordset method. Accepts a ``{field: {lang: value_or_terms}}`` payload
+        and applies it field-by-field. Works for any ``translate=True`` field,
+        including ``ir.ui.view.arch_db`` and qweb-style HTML.
+
+        Args:
+            model: The Odoo model name.
+            ids: List of record IDs to update.
+            translations: ``{field_name: {lang_code: value}}`` for plain
+                translatable fields, or ``{field_name: {lang_code: {term_src: term_value}}}``
+                for term-based fields like ``arch_db``.
+
+        Returns:
+            ``True`` when every field update succeeded.
+        """
+        if not ids:
+            raise OdooConnectionError("No record IDs provided for translation update")
+        if not translations:
+            raise OdooConnectionError("No translations provided")
+
+        all_ok = True
+        for field_name, per_lang in translations.items():
+            if not isinstance(per_lang, dict):
+                raise OdooConnectionError(f"Translations for field '{field_name}' must be a dict")
+            ok = self.execute_kw(
+                model,
+                "update_field_translations",
+                [ids, field_name, per_lang],
+                {},
+            )
+            all_ok = all_ok and bool(ok)
+            # Invalidate cache for affected records so subsequent reads reflect
+            # the new translations.
+            for record_id in ids:
+                self._performance_manager.invalidate_record_cache(model, record_id)
+        return all_ok
 
     def get_server_version(self) -> Optional[Dict[str, Any]]:
         """Get Odoo server version information.

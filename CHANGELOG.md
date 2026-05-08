@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-08
+
+### Added
+
+- **Mutable session locale**: The default `context.lang` injected on every Odoo
+  call is now a runtime-mutable session value (initialized from `ODOO_LOCALE`).
+  Two new tools manage it:
+  - `get_locale` — returns the current session locale and the languages
+    installed in the database (`res.lang`).
+  - `set_locale(lang)` — changes the default for subsequent calls; pass
+    `null`/empty to clear it. Validated against installed languages.
+- **Per-call language override**: `search_records`, `get_record`,
+  `read_records`, `create_record`, `create_records`, `update_record`, and
+  `update_records` accept an optional `lang` argument that overrides the
+  session locale for that single call (cache-bypassed to avoid mixing
+  translations).
+- **Multi-language read/write tools** for translatable fields, including
+  `ir.ui.view.arch_db` and qweb HTML:
+  - `get_field_translations(model, record_ids, field_names, langs?)` returns
+    every language at once via Odoo's `get_field_translations` API.
+  - `update_field_translations(model, record_ids, translations)` writes
+    `{field: {lang: value}}` (or `{field: {lang: {term_src: term_value}}}`
+    for term-based fields) directly into the jsonb storage via Odoo's
+    `update_field_translations` API. Other languages are left untouched.
+
+### Fixed
+
+- **`context.lang` no longer overwrites caller-provided values**: previously,
+  the configured locale was injected unconditionally on every `execute_kw`
+  call, masking any per-call language passed via `kwargs.context.lang`. The
+  injection now only fills in the default when the caller did not specify one.
+
 ## [0.4.7] - 2026-01-19
 
 ### Fixed
