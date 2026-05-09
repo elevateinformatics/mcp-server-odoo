@@ -387,7 +387,9 @@ class TestTranslationHelpers:
         assert methods == ["update_field_translations", "update_field_translations"]
 
     def test_update_field_translations_rejects_non_dict_payload(self):
+        from mcp_server_odoo.odoo_connection import OdooConnectionError
+
         conn, _ = _bootstrap_authenticated_connection(self._config())
 
-        with pytest.raises(Exception):
+        with pytest.raises(OdooConnectionError):
             conn.update_field_translations("product.template", [42], {"name": "not-a-dict"})
