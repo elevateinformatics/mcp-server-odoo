@@ -2,149 +2,437 @@ name: CI
 
 on:
   push:
-    branches: ['*']  # Run on all branches
+    branches: ['*']
   pull_request:
-    branches: ['*']  # Run on all PR branches
+    branches: ['*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     name: Lint and Type Check
     runs-on: ubuntu-latest
-    
+
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v6
+
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.10'
-    
+
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v7
       with:
         version: "latest"
-    
+        enable-cache: true
+
     - name: Install dependencies
       run: |
         uv pip install --system -e ".[dev]"
-    
-    - name: Check code formatting with Black
+
+    - name: Check code formatting with Ruff
       run: |
-        black --check --diff .
-    
+        ruff format --check --diff .
+
     - name: Lint with Ruff
       run: |
         ruff check . --output-format=github
-    
-    - name: Type check with MyPy
+
+    - name: Type check with ty
       run: |
-        mypy .
+        ty check .
 
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    needs: lint  # Only run tests if linting passes
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12']
-    
+        python-version: ['3.10', '3.13']
+
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v6
+
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v7
       with:
         version: "latest"
-    
+        enable-cache: true
+
     - name: Install dependencies
       run: |
         uv pip install --system -e ".[dev]"
-    
+
     - name: Run unit tests with coverage
       run: |
-        pytest -m "not integration" --cov=mcp_server_odoo --cov-report=xml --cov-report=term
+        pytest -m "not yolo and not mcp" --cov=mcp_server_odoo --cov-report=xml:coverage-unit.xml --cov-report=term
       env:
         ODOO_URL: ${{ vars.ODOO_URL || 'http://localhost:8069' }}
         ODOO_DB: ${{ vars.ODOO_DB || 'test' }}
         ODOO_API_KEY: ${{ vars.ODOO_API_KEY || 'test_api_key' }}
         ODOO_USER: ${{ vars.ODOO_USER || 'admin' }}
         ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD || 'admin' }}
-    
-    - name: Upload coverage to Codecov
-      if: matrix.python-version == '3.10'  # Only upload once
-      uses: codecov/codecov-action@v5
-      with:
-        files: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-        fail_ci_if_error: false
-        token: ${{ secrets.CODECOV_TOKEN }}
 
-  integration-test:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    needs: lint
-    continue-on-error: true  # Don't fail the workflow if integration tests fail
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Upload coverage artifact
+      if: matrix.python-version == '3.10'
+      uses: actions/upload-artifact@v7
       with:
-        python-version: '3.10'
-    
+        name: coverage-unit
+        path: coverage-unit.xml
+
+  yolo-integration-test:
+    name: YOLO Integration Tests
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U odoo"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+
     - name: Install uv
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@v7
       with:
         version: "latest"
-    
+        enable-cache: true
+
     - name: Install dependencies
       run: |
         uv pip install --system -e ".[dev]"
-    
-    - name: Run integration tests
+
+    - name: Start Odoo and initialize database
       run: |
-        pytest -m "integration" -v
+        docker run -d --name odoo --network "${{ job.services.postgres.network }}" \
+          -e HOST=postgres -e USER=odoo -e PASSWORD=odoo \
+          -p 8069:8069 \
+          odoo:18 -- --database test --init base,mail --without-demo all
+
+        # Wait for Odoo to finish initializing
+        echo "Waiting for Odoo to initialize database..."
+        for i in $(seq 1 60); do
+          if python -c "
+        import xmlrpc.client
+        try:
+            proxy = xmlrpc.client.ServerProxy('http://localhost:8069/xmlrpc/2/common')
+            uid = proxy.authenticate('test', 'admin', 'admin', {})
+            if uid:
+                print(f'Odoo ready, authenticated as uid={uid}')
+                exit(0)
+        except Exception as e:
+            exit(1)
+        " 2>/dev/null; then
+            echo "Odoo is ready!"
+            break
+          fi
+          echo "Waiting... ($i/60)"
+          sleep 5
+        done
+
+    - name: Generate API key for admin user
+      id: yolo-apikey
+      run: |
+        # Generate a random API key and compute its passlib hash inside the
+        # Odoo container (which already has passlib installed).
+        KEY_AND_HASH=$(docker exec odoo python3 -c "
+        import secrets
+        from passlib.context import CryptContext
+        key = secrets.token_hex(20)
+        ctx = CryptContext(['pbkdf2_sha512'])
+        key_hash = ctx.hash(key)
+        # Use pipe separator — safe because neither key nor hash contains |
+        print(f'{key}|{key_hash}')
+        ")
+
+        API_KEY=$(echo "$KEY_AND_HASH" | cut -d'|' -f1)
+        KEY_HASH=$(echo "$KEY_AND_HASH" | cut -d'|' -f2)
+        INDEX=${API_KEY:0:8}
+
+        # Insert into Odoo's API key table using dollar-quoting for the hash
+        # (passlib hashes contain $ characters that break normal SQL quoting).
+        # Note: res_users_apikeys has _log_access=False, so no create_uid/write_uid columns.
+        PGPASSWORD=odoo psql -h localhost -U odoo -d test -c \
+          "INSERT INTO res_users_apikeys (name, user_id, scope, index, key)
+           VALUES ('CI Test Key', 2, NULL, '${INDEX}', \$hash\$${KEY_HASH}\$hash\$)"
+
+        echo "key=${API_KEY}" >> "$GITHUB_OUTPUT"
+        echo "API key generated and inserted for admin user"
+
+    - name: Run YOLO integration tests
+      run: |
+        pytest -m "yolo" -v --cov=mcp_server_odoo --cov-report=xml:coverage-yolo.xml --cov-report=term
       env:
-        ODOO_URL: ${{ vars.ODOO_URL || 'http://localhost:8069' }}
-        ODOO_DB: ${{ vars.ODOO_DB || 'test' }}
-        ODOO_API_KEY: ${{ vars.ODOO_API_KEY || 'test_api_key' }}
-        ODOO_USER: ${{ vars.ODOO_USER || 'admin' }}
-        ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD || 'admin' }}
+        ODOO_URL: http://localhost:8069
+        ODOO_DB: test
+        ODOO_USER: admin
+        ODOO_PASSWORD: admin
+        ODOO_YOLO: "true"
+        ODOO_MCP_ENABLE_METHOD_CALLS: "true"
+        ODOO_API_KEY: ${{ steps.yolo-apikey.outputs.key }}
+
+    - name: Upload coverage artifact
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-yolo
+        path: coverage-yolo.xml
+
+  mcp-integration-test:
+    name: MCP Integration Tests
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    # Skip for fork PRs — secrets (ODOO_APPS_PAT) are not available
+    if: |
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U odoo"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Checkout MCP Odoo module
+      uses: actions/checkout@v6
+      with:
+        repository: ivnvxd/odoo-apps
+        ref: '18.0'
+        path: odoo-apps
+        token: ${{ secrets.ODOO_APPS_PAT }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.13'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        version: "latest"
+        enable-cache: true
+
+    - name: Install dependencies
+      run: |
+        uv pip install --system -e ".[dev]"
+
+    - name: Start Odoo with MCP module and initialize database
+      run: |
+        docker run -d --name odoo-mcp --network "${{ job.services.postgres.network }}" \
+          -e HOST=postgres -e USER=odoo -e PASSWORD=odoo \
+          -v "${{ github.workspace }}/odoo-apps:/mnt/extra-addons" \
+          -p 8069:8069 \
+          odoo:18 -- --database test --init base,mcp_server --without-demo all
+
+        # Wait for Odoo to finish initializing (includes MCP module install)
+        echo "Waiting for Odoo to initialize database with MCP module..."
+        for i in $(seq 1 90); do
+          if python -c "
+        import xmlrpc.client
+        try:
+            proxy = xmlrpc.client.ServerProxy('http://localhost:8069/xmlrpc/2/common')
+            uid = proxy.authenticate('test', 'admin', 'admin', {})
+            if uid:
+                print(f'Odoo ready, authenticated as uid={uid}')
+                exit(0)
+        except Exception as e:
+            exit(1)
+        " 2>/dev/null; then
+            echo "Odoo is ready!"
+            break
+          fi
+          echo "Waiting... ($i/90)"
+          sleep 5
+        done
+
+    - name: Configure MCP module
+      run: |
+        python -c "
+        import xmlrpc.client
+
+        url = 'http://localhost:8069'
+        db = 'test'
+
+        common = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/common')
+        uid = common.authenticate(db, 'admin', 'admin', {})
+        assert uid, 'Failed to authenticate'
+        print(f'Authenticated as uid={uid}')
+
+        models = xmlrpc.client.ServerProxy(f'{url}/xmlrpc/2/object')
+
+        # Enable MCP with API key validation. Rate limiting is disabled in CI:
+        # the suite hits the addon's ~300/min ceiling because all tests run
+        # under the single admin API key. Disabling it here keeps tests
+        # deterministic — production deployments leave it on (default True).
+        for param, value in [
+            ('mcp_server.enabled', 'True'),
+            ('mcp_server.use_api_keys', 'True'),
+            ('mcp_server.enable_rate_limiting', 'False'),
+        ]:
+            models.execute_kw(db, uid, 'admin', 'ir.config_parameter', 'set_param', [param, value])
+        print('MCP enabled, API keys enabled, rate limiting disabled (CI only)')
+
+        # Enable models with permissions matching auth-test-matrix.md:
+        # - res.partner: read+write+unlink only (create=False for restricted ops test)
+        # - res.company: full CRUD (used by write cycle tests)
+        # - res.country: read only (unlink=False for restricted ops test)
+        # - res.users: NOT enabled (read denied for restricted ops test)
+        model_permissions = {
+            'res.partner': {'allow_read': True, 'allow_create': False, 'allow_write': True, 'allow_unlink': True},
+            'res.company': {'allow_read': True, 'allow_create': True, 'allow_write': True, 'allow_unlink': True},
+            'res.country': {'allow_read': True, 'allow_create': False, 'allow_write': False, 'allow_unlink': False},
+        }
+        for model_name, perms in model_permissions.items():
+            model_ids = models.execute_kw(db, uid, 'admin', 'ir.model', 'search', [
+                [('model', '=', model_name)]
+            ])
+            if model_ids:
+                models.execute_kw(db, uid, 'admin', 'mcp.enabled.model', 'create', [{
+                    'model_id': model_ids[0],
+                    **perms,
+                }])
+                print(f'Enabled model: {model_name} {perms}')
+        print('MCP setup complete (res.users intentionally NOT enabled)')
+        "
+
+    - name: Generate API key for admin user
+      id: mcp-apikey
+      run: |
+        KEY_AND_HASH=$(docker exec odoo-mcp python3 -c "
+        import secrets
+        from passlib.context import CryptContext
+        key = secrets.token_hex(20)
+        ctx = CryptContext(['pbkdf2_sha512'])
+        key_hash = ctx.hash(key)
+        print(f'{key}|{key_hash}')
+        ")
+
+        API_KEY=$(echo "$KEY_AND_HASH" | cut -d'|' -f1)
+        KEY_HASH=$(echo "$KEY_AND_HASH" | cut -d'|' -f2)
+        INDEX=${API_KEY:0:8}
+
+        PGPASSWORD=odoo psql -h localhost -U odoo -d test -c \
+          "INSERT INTO res_users_apikeys (name, user_id, scope, index, key)
+           VALUES ('CI Test Key', 2, NULL, '${INDEX}', \$hash\$${KEY_HASH}\$hash\$)"
+
+        echo "key=${API_KEY}" >> "$GITHUB_OUTPUT"
+        echo "API key generated and inserted for admin user"
+
+    - name: Run MCP integration tests
+      run: |
+        pytest -m "mcp" -v --cov=mcp_server_odoo --cov-report=xml:coverage-mcp.xml --cov-report=term
+      env:
+        ODOO_URL: http://localhost:8069
+        ODOO_DB: test
+        ODOO_USER: admin
+        ODOO_PASSWORD: admin
+        ODOO_API_KEY: ${{ steps.mcp-apikey.outputs.key }}
+
+    - name: Upload coverage artifact
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: coverage-mcp
+        path: coverage-mcp.xml
+
+  coverage:
+    name: Upload Coverage
+    runs-on: ubuntu-latest
+    needs: [test, yolo-integration-test, mcp-integration-test]
+    if: always()
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Download coverage artifacts
+      uses: actions/download-artifact@v8
+      with:
+        pattern: coverage-*
+        merge-multiple: true
+        path: coverage-reports
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+
+    - name: Merge and upload coverage
+      uses: codecov/codecov-action@v6
+      with:
+        directory: coverage-reports
+        flags: all
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   build:
     name: Build Package
     runs-on: ubuntu-latest
-    needs: [lint, test]
-    
+    needs: [lint, test, yolo-integration-test, mcp-integration-test]
+    if: |
+      always()
+      && needs.lint.result == 'success'
+      && needs.test.result == 'success'
+      && (needs.yolo-integration-test.result == 'success' || needs.yolo-integration-test.result == 'skipped')
+      && (needs.mcp-integration-test.result == 'success' || needs.mcp-integration-test.result == 'skipped')
+
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v6
+
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.10'
-    
+
     - name: Install build tools
       run: |
         pip install build twine
-    
+
     - name: Build package
       run: |
         python -m build
-    
+
     - name: Check package
       run: |
         twine check dist/*
-    
+
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-distributions
         path: dist/

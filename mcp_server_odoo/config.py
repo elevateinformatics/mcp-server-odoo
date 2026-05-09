@@ -4,12 +4,15 @@ This module handles loading and validation of environment variables
 for connecting to Odoo via XML-RPC.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,8 +44,11 @@ class OdooConfig:
     yolo_mode: str = "off"  # "off", "read", or "true"
 
     # Cache TTL configuration (in seconds)
-    cache_field_ttl: int = 3600  # 1 hour for field metadata (on-demand only)
-    cache_permission_ttl: int = 300  # 5 minutes for permissions
+    cache_field_ttl: int = 3600
+    cache_permission_ttl: int = 300
+
+    # Opt-in for call_model_method (effective only with yolo_mode == "true").
+    enable_method_calls: bool = False
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -107,6 +113,14 @@ class OdooConfig:
         if self.port <= 0 or self.port > 65535:
             raise ValueError("Port must be between 1 and 65535")
 
+        # Without this warning, the silent non-registration is hard to debug.
+        if self.enable_method_calls and self.yolo_mode != "true":
+            logger.warning(
+                "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored: requires ODOO_YOLO=true "
+                "(full YOLO mode); current yolo_mode=%r",
+                self.yolo_mode,
+            )
+
     @property
     def uses_api_key(self) -> bool:
         """Check if configuration uses API key authentication."""
@@ -130,6 +144,10 @@ class OdooConfig:
     def get_endpoint_paths(self) -> Dict[str, str]:
         """Get appropriate endpoint paths based on mode.
 
+        The DB endpoint always uses the server-wide ``/xmlrpc/db`` path
+        so that database listing works even when multiple databases exist
+        (MCP addon routes require a DB context that isn't available yet).
+
         Returns:
             Dict[str, str]: Mapping of endpoint names to paths
         """
@@ -137,9 +155,9 @@ class OdooConfig:
             # Use standard Odoo endpoints in YOLO mode
             return {"db": "/xmlrpc/db", "common": "/xmlrpc/2/common", "object": "/xmlrpc/2/object"}
         else:
-            # Use MCP-specific endpoints in standard mode
+            # DB endpoint is always server-wide; common/object use MCP routes
             return {
-                "db": "/mcp/xmlrpc/db",
+                "db": "/xmlrpc/db",
                 "common": "/mcp/xmlrpc/common",
                 "object": "/mcp/xmlrpc/object",
             }
@@ -179,12 +197,16 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
             )
         load_dotenv(env_file)
     else:
-        # Check current directory for .env
+        # Try to load .env from current directory
         default_env = Path(".env")
+        env_loaded = False
+
         if default_env.exists():
-            load_dotenv()
-        elif not os.getenv("ODOO_URL"):
-            # No .env file and no ODOO_URL in environment
+            load_dotenv(default_env)
+            env_loaded = True
+
+        # If no .env file found and no ODOO_URL in environment, raise error
+        if not env_loaded and not os.getenv("ODOO_URL"):
             raise ValueError(
                 "No .env file found and ODOO_URL not set in environment.\n"
                 "Please create a .env file based on .env.example or set environment variables."
@@ -199,6 +221,12 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
             return int(value)
         except ValueError:
             raise ValueError(f"{key} must be a valid integer") from None
+
+    def get_bool_env(key: str, default: bool = False) -> bool:
+        raw = os.getenv(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"true", "1", "yes"}
 
     # Helper function to parse YOLO mode
     def get_yolo_mode() -> str:
@@ -232,6 +260,7 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         yolo_mode=get_yolo_mode(),
         cache_field_ttl=get_int_env("ODOO_CACHE_FIELD_TTL", 3600),
         cache_permission_ttl=get_int_env("ODOO_CACHE_PERMISSION_TTL", 300),
+        enable_method_calls=get_bool_env("ODOO_MCP_ENABLE_METHOD_CALLS", False),
     )
 
     return config
