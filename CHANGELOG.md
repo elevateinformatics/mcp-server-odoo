@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI lint job**: pre-commit was running `black` while CI runs `ruff format` —
+  the two tools disagree on `assert x, msg` formatting, so commits that passed
+  pre-commit could fail CI. Removed black from pre-commit and dev deps; both
+  pre-commit and CI now use `ruff format`. Repo reformatted accordingly.
+
 ## [0.7.0] - 2026-05-10
 
 ### Added

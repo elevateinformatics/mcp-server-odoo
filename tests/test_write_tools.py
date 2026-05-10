@@ -459,12 +459,12 @@ class TestWriteToolsIntegration:
             stored_body = msg["body"]
             # Plain-str path must escape '<' to '&lt;' (positive assertion catches
             # both "literal < survived" and "substring stripped entirely" failures).
-            assert (
-                "5 &lt; 10" in stored_body
-            ), f"Expected '<' to be escaped to '&lt;', got: {stored_body!r}"
-            assert (
-                "5 < 10" not in stored_body
-            ), f"Plain-str body should be escaped, but stored as: {stored_body!r}"
+            assert "5 &lt; 10" in stored_body, (
+                f"Expected '<' to be escaped to '&lt;', got: {stored_body!r}"
+            )
+            assert "5 < 10" not in stored_body, (
+                f"Plain-str body should be escaped, but stored as: {stored_body!r}"
+            )
         finally:
             try:
                 handler.connection.unlink("mail.message", [message_id])
@@ -578,12 +578,12 @@ class TestWriteToolsIntegration:
             # With body_is_html=True the literal HTML tags survive — neither
             # '<p>' nor '<b>' should be encoded to '&lt;p&gt;' / '&lt;b&gt;'
             assert "<p>" in stored_body, f"Expected literal <p>, got: {stored_body!r}"
-            assert (
-                "<b>bold</b>" in stored_body
-            ), f"Expected literal <b>bold</b>, got: {stored_body!r}"
-            assert (
-                "&lt;p&gt;" not in stored_body
-            ), f"HTML markup was double-escaped: {stored_body!r}"
+            assert "<b>bold</b>" in stored_body, (
+                f"Expected literal <b>bold</b>, got: {stored_body!r}"
+            )
+            assert "&lt;p&gt;" not in stored_body, (
+                f"HTML markup was double-escaped: {stored_body!r}"
+            )
         finally:
             try:
                 handler.connection.unlink("mail.message", [message_id])
@@ -621,9 +621,9 @@ class TestWriteToolsIntegration:
                 ["partner_ids"],
             )
             recipients = messages[0]["partner_ids"]  # list of ids
-            assert (
-                recipient_id in recipients
-            ), f"Expected partner {recipient_id} in recipients, got {recipients}"
+            assert recipient_id in recipients, (
+                f"Expected partner {recipient_id} in recipients, got {recipients}"
+            )
         finally:
             try:
                 handler.connection.unlink("mail.message", [message_id])
@@ -764,9 +764,9 @@ class TestCallModelMethodIntegration:
         )
 
         assert result["success"] is True
-        assert (
-            isinstance(result["result"], list) and result["result"]
-        ), f"expected non-empty list of dicts, got {result['result']!r}"
+        assert isinstance(result["result"], list) and result["result"], (
+            f"expected non-empty list of dicts, got {result['result']!r}"
+        )
         assert "name" in result["result"][0]
 
     @pytest.mark.yolo

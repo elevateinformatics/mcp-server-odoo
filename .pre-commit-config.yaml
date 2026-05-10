@@ -1,5 +1,8 @@
-# Pre-commit hooks — mirror the lint job in `.github/workflows/ci.yml`
-# so failures surface locally before a commit lands.
+# Pre-commit hooks — mirror the lint job in `.github/workflows/ci.yml` so
+# failures surface locally before a commit lands. CI runs `ruff format --check`
+# and `ruff check`, so hooks use the same tools. Black is intentionally NOT
+# included: it disagrees with ruff on `assert x, msg` formatting and would
+# fight CI on every commit.
 #
 # Setup (once per clone):
 #   pip install pre-commit
@@ -12,11 +15,6 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.12
     hooks:
+      - id: ruff-format
       - id: ruff
         args: [--fix]
-
-  - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 26.1.0
-    hooks:
-      - id: black
-        language_version: python3
