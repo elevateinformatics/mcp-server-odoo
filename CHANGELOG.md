@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-10
+
+### Added
+
+- **`tail_logs` and `list_log_files` tools** — first-class MCP tools wrapping the
+  companion Odoo module
+  [`elevate_informatics_log_reader`](https://github.com/elevateinformatics/elevate_informatics_log_reader).
+  Runtime detection of the model surfaces a clear install hint when the module
+  is missing — no need to call `call_model_method` manually, no YOLO required if
+  the model is whitelisted in `mcp.enabled.model`.
+
 ### Merged from upstream `ivnvxd/mcp-server-odoo` v0.6.0
 
 Upstream features adopted while preserving the `mcp-server-odoo-ei` fork:

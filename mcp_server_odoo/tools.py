@@ -908,6 +908,62 @@ class OdooToolHandler:
                 )
                 return CallModelMethodResult(**result)
 
+        @self.app.tool(
+            title="List Log Files",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def list_log_files(ctx: Optional[Context] = None) -> Dict[str, Any]:
+            """List Odoo / system log files visible to the server.
+
+            Requires the ``elevate_informatics_log_reader`` Odoo module to be
+            installed (https://github.com/elevateinformatics/elevate_informatics_log_reader).
+            Returns a clear error pointing to the install instructions when the
+            module is missing.
+
+            Returns:
+                Dict with ``files`` (each ``{path, size_bytes, mtime, readable,
+                is_configured_logfile}``), ``configured_logfile``, ``dirs_scanned``.
+            """
+            return await self._handle_list_log_files_tool(ctx)
+
+        @self.app.tool(
+            title="Tail Log",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def tail_logs(
+            path: Optional[str] = None,
+            lines: int = 200,
+            grep: Optional[str] = None,
+            ctx: Optional[Context] = None,
+        ) -> Dict[str, Any]:
+            """Return the last ``lines`` lines of an Odoo log file.
+
+            Requires the ``elevate_informatics_log_reader`` Odoo module
+            (https://github.com/elevateinformatics/elevate_informatics_log_reader).
+
+            Args:
+                path: Absolute path. ``None`` (default) → the active Odoo
+                    log file (``tools.config['logfile']``, typically
+                    ``~/logs/odoo.log`` on Odoo.sh).
+                lines: Number of trailing lines (1..5000).
+                grep: Optional substring filter applied after tailing.
+
+            Returns:
+                Dict with ``path``, ``lines``, ``count``, ``truncated``,
+                ``size_bytes``.
+            """
+            return await self._handle_tail_logs_tool(path, lines, grep, ctx)
+
         @self.app.tool()
         async def get_locale() -> Dict[str, Any]:
             """Return the current session locale and the languages installed in Odoo.
@@ -1777,6 +1833,76 @@ class OdooToolHandler:
             logger.error(f"Error in update_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ValidationError(f"Failed to update records: {sanitized_msg}") from e
+
+    # ------------------------------------------------------------------
+    # Log reader (companion module: elevate_informatics_log_reader)
+    # ------------------------------------------------------------------
+
+    LOG_READER_MODEL = "elevate.log.reader"
+    LOG_READER_INSTALL_HINT = (
+        "Install the Odoo module 'elevate_informatics_log_reader' "
+        "(https://github.com/elevateinformatics/elevate_informatics_log_reader) "
+        "and ensure the calling user has the 'Settings / Administration' group."
+    )
+
+    def _ensure_log_reader_available(self) -> None:
+        """Raise ValidationError with a helpful hint if the log reader model is missing."""
+        if not self.connection.is_authenticated:
+            raise ValidationError("Not authenticated with Odoo")
+        try:
+            existing = self.connection.search(
+                "ir.model", [("model", "=", self.LOG_READER_MODEL)], limit=1
+            )
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error while probing log reader: {e}") from e
+        if not existing:
+            raise ValidationError(
+                f"Model '{self.LOG_READER_MODEL}' not found on this Odoo. "
+                f"{self.LOG_READER_INSTALL_HINT}"
+            )
+
+    async def _handle_list_log_files_tool(self, ctx=None) -> Dict[str, Any]:
+        """Delegate to elevate.log.reader.list_files()."""
+        try:
+            with perf_logger.track_operation("tool_list_log_files"):
+                self._ensure_log_reader_available()
+                await self._ctx_info(ctx, "Listing Odoo log files...")
+                return self.connection.execute_kw(self.LOG_READER_MODEL, "list_files", [], {})
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in list_log_files tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to list log files: {sanitized_msg}") from e
+
+    async def _handle_tail_logs_tool(
+        self,
+        path: Optional[str],
+        lines: int,
+        grep: Optional[str],
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Delegate to elevate.log.reader.tail()."""
+        try:
+            with perf_logger.track_operation("tool_tail_logs"):
+                self._ensure_log_reader_available()
+                kwargs: Dict[str, Any] = {"lines": lines}
+                if path is not None:
+                    kwargs["path"] = path
+                if grep is not None:
+                    kwargs["grep"] = grep
+                await self._ctx_info(ctx, f"Tailing log{f' {path}' if path else ' (default)'}...")
+                return self.connection.execute_kw(self.LOG_READER_MODEL, "tail", [], kwargs)
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in tail_logs tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to tail log: {sanitized_msg}") from e
 
     async def _handle_get_locale_tool(self) -> Dict[str, Any]:
         """Handle get_locale tool request."""

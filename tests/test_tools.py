@@ -96,6 +96,9 @@ class TestOdooToolHandler:
             "set_locale",
             "get_field_translations",
             "update_field_translations",
+            # Log reader (companion module: elevate_informatics_log_reader)
+            "list_log_files",
+            "tail_logs",
         }
         # call_model_method is opt-in (yolo+enable_method_calls), not asserted here
         assert set(mock_app._tools.keys()) == expected_tools
@@ -3301,3 +3304,128 @@ class TestCallModelMethodTool:
                 arguments=[[1]],
                 keyword_arguments=oversize,
             )
+
+
+class TestLogReaderTools:
+    """Tests for the log reader tool wrappers (companion module:
+    elevate_informatics_log_reader)."""
+
+    @pytest.fixture
+    def mock_app(self):
+        app = MagicMock(spec=FastMCP)
+        app._tools = {}
+
+        def tool_decorator(*args, **kwargs):
+            def decorator(func):
+                app._tools[func.__name__] = func
+                return func
+
+            return decorator
+
+        app.tool = tool_decorator
+        return app
+
+    @pytest.fixture
+    def mock_connection(self):
+        conn = MagicMock(spec=OdooConnection)
+        conn.is_authenticated = True
+        return conn
+
+    @pytest.fixture
+    def mock_access_controller(self):
+        return MagicMock(spec=AccessController)
+
+    @pytest.fixture
+    def valid_config(self):
+        return OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            database="test_db",
+        )
+
+    @pytest.fixture
+    def handler(self, mock_app, mock_connection, mock_access_controller, valid_config):
+        return OdooToolHandler(mock_app, mock_connection, mock_access_controller, valid_config)
+
+    @pytest.mark.asyncio
+    async def test_list_log_files_delegates_to_module(self, handler, mock_connection, mock_app):
+        """When the module is installed, list_log_files calls execute_kw on the model."""
+        mock_connection.search.return_value = [990]  # ir.model id (truthy)
+        mock_connection.execute_kw.return_value = {
+            "files": [{"path": "/home/odoo/logs/odoo.log", "readable": True}],
+            "configured_logfile": "/home/odoo/logs/odoo.log",
+            "dirs_scanned": ["/home/odoo/logs"],
+        }
+
+        result = await mock_app._tools["list_log_files"]()
+
+        assert result["configured_logfile"] == "/home/odoo/logs/odoo.log"
+        mock_connection.search.assert_called_once_with(
+            "ir.model", [("model", "=", "elevate.log.reader")], limit=1
+        )
+        mock_connection.execute_kw.assert_called_once_with(
+            "elevate.log.reader", "list_files", [], {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_log_files_missing_module_raises_helpful_error(
+        self, handler, mock_connection, mock_app
+    ):
+        """When the module is NOT installed, surface a clear install hint."""
+        mock_connection.search.return_value = []  # model not found
+
+        with pytest.raises(ValidationError, match="elevate_informatics_log_reader"):
+            await mock_app._tools["list_log_files"]()
+
+        # Should NOT have attempted execute_kw on the missing model
+        mock_connection.execute_kw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tail_logs_default_path(self, handler, mock_connection, mock_app):
+        """tail_logs without path forwards an empty kwargs except 'lines'."""
+        mock_connection.search.return_value = [990]
+        mock_connection.execute_kw.return_value = {
+            "path": "/home/odoo/logs/odoo.log",
+            "lines": ["INFO ..."],
+            "count": 1,
+            "truncated": False,
+            "size_bytes": 100,
+        }
+
+        await mock_app._tools["tail_logs"](lines=50)
+
+        mock_connection.execute_kw.assert_called_once_with(
+            "elevate.log.reader", "tail", [], {"lines": 50}
+        )
+
+    @pytest.mark.asyncio
+    async def test_tail_logs_with_path_and_grep(self, handler, mock_connection, mock_app):
+        """tail_logs forwards path + grep kwargs when provided."""
+        mock_connection.search.return_value = [990]
+        mock_connection.execute_kw.return_value = {
+            "path": "/home/odoo/logs/odoo.log.2026-05-09",
+            "lines": [],
+            "count": 0,
+            "truncated": False,
+            "size_bytes": 1234,
+        }
+
+        await mock_app._tools["tail_logs"](
+            path="/home/odoo/logs/odoo.log.2026-05-09", lines=500, grep="ERROR"
+        )
+
+        mock_connection.execute_kw.assert_called_once_with(
+            "elevate.log.reader",
+            "tail",
+            [],
+            {"lines": 500, "path": "/home/odoo/logs/odoo.log.2026-05-09", "grep": "ERROR"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_tail_logs_missing_module_raises_helpful_error(
+        self, handler, mock_connection, mock_app
+    ):
+        mock_connection.search.return_value = []
+
+        with pytest.raises(ValidationError, match="elevate_informatics_log_reader"):
+            await mock_app._tools["tail_logs"](lines=10)
