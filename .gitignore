@@ -128,3 +128,6 @@ docs/
 *.scss.map
 
 .mcp.json
+
+# Claude Code per-developer local settings (machine-specific paths, etc.)
+.claude/settings.local.json
