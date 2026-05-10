@@ -5,11 +5,16 @@ Tools are different from resources - they can have side effects and perform
 actions like creating, updating, or deleting records.
 """
 
+import base64
 import json
+import re
+import xmlrpc.client
+from ast import literal_eval as _parse_python_literal
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 from .access_control import AccessControlError, AccessController
 from .config import OdooConfig
@@ -20,11 +25,41 @@ from .error_handling import (
 from .error_sanitizer import ErrorSanitizer
 from .logging_config import get_logger, perf_logger
 from .odoo_connection import OdooConnection, OdooConnectionError
+from .schemas import (
+    AggregateResult,
+    CallModelMethodResult,
+    CreateResult,
+    DeleteResult,
+    FieldSelectionMetadata,
+    ModelsResult,
+    PostMessageResult,
+    RecordResult,
+    ResourceTemplatesResult,
+    SearchResult,
+    UpdateResult,
+)
 
 logger = get_logger(__name__)
 
-# Legacy error type alias for backward compatibility
-ToolError = ValidationError
+# Public Odoo method = Python identifier not starting with "_".
+_PUBLIC_METHOD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# Refuse JSON strings larger than this on the parse path — bounds memory and
+# guards against pathological inputs.
+_MAX_JSON_PARAM_BYTES = 1_000_000
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce XML-RPC return types Pydantic can't serialize (Binary, DateTime)."""
+    if isinstance(value, xmlrpc.client.Binary):
+        return base64.b64encode(value.data).decode("ascii")
+    if isinstance(value, xmlrpc.client.DateTime):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 class OdooToolHandler:
@@ -145,76 +180,6 @@ class OdooToolHandler:
                     record[field_name] = formatted
 
         return record
-
-    def _should_include_field_by_default(self, field_name: str, field_info: Dict[str, Any]) -> bool:
-        """Determine if a field should be included in default response.
-
-        Args:
-            field_name: Name of the field
-            field_info: Field metadata from fields_get()
-
-        Returns:
-            True if field should be included in default response
-        """
-        # Always include essential fields
-        always_include = {"id", "name", "display_name", "active"}
-        if field_name in always_include:
-            return True
-
-        # Exclude system/technical fields by prefix
-        exclude_prefixes = ("_", "message_", "activity_", "website_message_")
-        if field_name.startswith(exclude_prefixes):
-            return False
-
-        # Exclude specific technical fields
-        exclude_fields = {
-            "write_date",
-            "create_date",
-            "write_uid",
-            "create_uid",
-            "__last_update",
-            "access_token",
-            "access_warning",
-            "access_url",
-        }
-        if field_name in exclude_fields:
-            return False
-
-        # Get field type
-        field_type = field_info.get("type", "")
-
-        # Exclude binary and large fields
-        if field_type in ("binary", "image", "html"):
-            return False
-
-        # Exclude expensive computed fields (non-stored)
-        if field_info.get("compute") and not field_info.get("store", True):
-            return False
-
-        # Exclude one2many and many2many fields (can be large)
-        if field_type in ("one2many", "many2many"):
-            return False
-
-        # Include required fields
-        if field_info.get("required"):
-            return True
-
-        # Include simple stored fields that are searchable
-        if field_info.get("store", True) and field_info.get("searchable", True):
-            if field_type in (
-                "char",
-                "text",
-                "boolean",
-                "integer",
-                "float",
-                "date",
-                "datetime",
-                "selection",
-                "many2one",
-            ):
-                return True
-
-        return False
 
     def _score_field_importance(self, field_name: str, field_info: Dict[str, Any]) -> int:
         """Score field importance for smart default selection.
@@ -378,19 +343,87 @@ class OdooToolHandler:
             # Return None to indicate we should get all fields
             return None
 
+    def _parse_domain_input(self, domain: Optional[Any]) -> List[Any]:
+        """Coerce a domain parameter into an Odoo domain list.
+
+        Accepts a list (passed through), a JSON string, a Python-literal
+        string with single quotes / ``True``/``False`` capitalization, or
+        ``None`` (returns ``[]``). Raises ``ValidationError`` on anything
+        that doesn't yield a list.
+        """
+        if domain is None:
+            return []
+        if not isinstance(domain, str):
+            return domain
+
+        try:
+            parsed = json.loads(domain)
+        except json.JSONDecodeError:
+            try:
+                json_domain = domain.replace("'", '"')
+                json_domain = json_domain.replace("True", "true").replace("False", "false")
+                parsed = json.loads(json_domain)
+            except json.JSONDecodeError as e:
+                try:
+                    parsed = _parse_python_literal(domain)
+                except (ValueError, SyntaxError):
+                    raise ValidationError(
+                        f"Invalid domain parameter. Expected JSON array or Python list, "
+                        f"got: {domain[:100]}..."
+                    ) from e
+
+        if not isinstance(parsed, list):
+            raise ValidationError(f"Domain must be a list, got {type(parsed).__name__}")
+
+        logger.debug(f"Parsed domain from string: {parsed}")
+        return parsed
+
+    async def _ctx_info(self, ctx, message: str):
+        """Send info to MCP client context if available."""
+        if ctx:
+            try:
+                await ctx.info(message)
+            except Exception:
+                logger.debug(f"Failed to send ctx info: {message}")
+
+    async def _ctx_warning(self, ctx, message: str):
+        """Send warning to MCP client context if available."""
+        if ctx:
+            try:
+                await ctx.warning(message)
+            except Exception:
+                logger.debug(f"Failed to send ctx warning: {message}")
+
+    async def _ctx_progress(self, ctx, progress: float, total: float, message: str = ""):
+        """Report progress to MCP client context if available."""
+        if ctx:
+            try:
+                await ctx.report_progress(progress, total, message)
+            except Exception:
+                logger.debug(f"Failed to report progress: {progress}/{total}")
+
     def _register_tools(self):
         """Register all tool handlers with FastMCP."""
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Search Records",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
         async def search_records(
             model: str,
-            domain: Optional[Union[str, List[Union[str, List[Any]]]]] = None,
-            fields: Optional[Union[str, List[str]]] = None,
-            limit: int = 10,
+            domain: Optional[Any] = None,
+            fields: Optional[Any] = None,
+            limit: Optional[int] = None,
             offset: int = 0,
             order: Optional[str] = None,
             lang: Optional[str] = None,
-        ) -> Dict[str, Any]:
+            ctx: Optional[Context] = None,
+        ) -> SearchResult:
             """Search for records in an Odoo model.
 
             Args:
@@ -404,7 +437,9 @@ class OdooToolHandler:
                     - A list: ["field1", "field2", ...] - Returns only specified fields
                     - A JSON string: '["field1", "field2"]' - Parsed to list
                     - ["__all__"] or '["__all__"]': Returns ALL fields (warning: may cause serialization errors)
-                limit: Maximum number of records to return
+                limit: Maximum number of records to return. Omit to use the
+                    server-configured default (ODOO_MCP_DEFAULT_LIMIT). Capped
+                    at ODOO_MCP_MAX_LIMIT.
                 offset: Number of records to skip
                 order: Sort order (e.g., 'name asc')
                 lang: Optional one-shot language override (Odoo lang code,
@@ -412,17 +447,29 @@ class OdooToolHandler:
                     language for this call only; the session locale is unchanged.
 
             Returns:
-                Dictionary with 'records' list and 'total' count
+                Search results with records, total count, and pagination info
             """
-            return await self._handle_search_tool(model, domain, fields, limit, offset, order, lang)
+            result = await self._handle_search_tool(
+                model, domain, fields, limit, offset, order, lang, ctx
+            )
+            return SearchResult(**result)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Get Record",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
         async def get_record(
             model: str,
             record_id: int,
             fields: Optional[List[str]] = None,
             lang: Optional[str] = None,
-        ) -> Dict[str, Any]:
+            ctx: Optional[Context] = None,
+        ) -> RecordResult:
             """Get a specific record by ID with smart field selection.
 
             This tool supports selective field retrieval to optimize performance and response size.
@@ -456,75 +503,71 @@ class OdooToolHandler:
                 get_record("res.partner", 1, fields=["__all__"])
 
             Returns:
-                Dictionary with record data containing requested fields.
-                When using smart defaults, includes _metadata with field statistics.
+                Record data with requested fields. When using smart defaults,
+                includes metadata with field statistics.
             """
-            return await self._handle_get_record_tool(model, record_id, fields, lang)
+            return await self._handle_get_record_tool(model, record_id, fields, lang, ctx)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Read Records (batch)",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
         async def read_records(
             model: str,
             record_ids: List[int],
             fields: Optional[List[str]] = None,
             lang: Optional[str] = None,
+            ctx: Optional[Context] = None,
         ) -> Dict[str, Any]:
             """Read multiple records by their IDs in a single API call (batch operation).
 
-            This is more efficient than calling get_record multiple times
-            when you need to retrieve specific records by ID.
+            More efficient than calling get_record multiple times.
 
             Args:
                 model: The Odoo model name (e.g., 'res.partner')
                 record_ids: List of record IDs to read
-                fields: Optional list of fields to return. If None, uses smart defaults.
-                       Use ["__all__"] to get all fields.
-                lang: Optional one-shot language override (Odoo lang code,
-                    e.g. ``"es_AR"``). Translatable fields are returned in this
-                    language for this call only; the session locale is unchanged.
+                fields: Optional list of fields. None → smart defaults; ["__all__"] → all fields.
+                lang: Optional one-shot language override (Odoo lang code).
 
             Returns:
-                Dictionary with:
-                - records: List of record data
-                - count: Number of records returned
-                - missing_ids: List of IDs that were not found (if any)
-
-            Example:
-                # Read 50 specific partners in a single call
-                read_records("res.partner", [1, 2, 3, ...], ["name", "email"])
+                Dictionary with `records`, `count`, `missing_ids`, `model`.
             """
-            return await self._handle_read_records_tool(model, record_ids, fields, lang)
+            return await self._handle_read_records_tool(model, record_ids, fields, lang, ctx)
 
-        @self.app.tool()
-        async def list_models() -> Dict[str, Any]:
+        @self.app.tool(
+            title="List Models",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def list_models(ctx: Optional[Context] = None) -> ModelsResult:
             """List all models enabled for MCP access with their allowed operations.
 
             Returns:
-                Dictionary containing a list of model information dictionaries.
-                Each model includes:
-                - model: Technical name (e.g., 'res.partner')
-                - name: Display name (e.g., 'Contact')
-                - operations: Dict of allowed operations (read, write, create, unlink)
-
-            Example response:
-                {
-                    "models": [
-                        {
-                            "model": "res.partner",
-                            "name": "Contact",
-                            "operations": {
-                                "read": true,
-                                "write": true,
-                                "create": true,
-                                "unlink": false
-                            }
-                        }
-                    ]
-                }
+                List of models with their technical names, display names,
+                and allowed operations (read, write, create, unlink).
             """
-            return await self._handle_list_models_tool()
+            result = await self._handle_list_models_tool(ctx)
+            return ModelsResult(**result)
 
-        @self.app.tool()
-        async def list_resource_templates() -> Dict[str, Any]:
+        @self.app.tool(
+            title="List Resource Templates",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def list_resource_templates(ctx: Optional[Context] = None) -> ResourceTemplatesResult:
             """List available resource URI templates.
 
             Since MCP resources with parameters are registered as templates,
@@ -532,19 +575,26 @@ class OdooToolHandler:
             information about available resource patterns you can use.
 
             Returns:
-                Dictionary with resource template information including:
-                - templates: List of resource template definitions
-                - examples: Example URIs for each template
-                - enabled_models: List of models you can use with these templates
+                Resource template definitions with examples and enabled models.
             """
-            return await self._handle_list_resource_templates_tool()
+            result = await self._handle_list_resource_templates_tool(ctx)
+            return ResourceTemplatesResult(**result)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Create Record",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
         async def create_record(
             model: str,
             values: Dict[str, Any],
             lang: Optional[str] = None,
-        ) -> Dict[str, Any]:
+            ctx: Optional[Context] = None,
+        ) -> CreateResult:
             """Create a new record in an Odoo model.
 
             Args:
@@ -557,48 +607,56 @@ class OdooToolHandler:
                     you need different values per language.
 
             Returns:
-                Dictionary with created record details
+                Created record details with ID, URL, and confirmation.
             """
-            return await self._handle_create_record_tool(model, values, lang)
+            result = await self._handle_create_record_tool(model, values, lang, ctx)
+            return CreateResult(**result)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Create Records (batch)",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
         async def create_records(
             model: str,
             records: List[Dict[str, Any]],
             lang: Optional[str] = None,
+            ctx: Optional[Context] = None,
         ) -> Dict[str, Any]:
             """Create multiple records in a single API call (batch operation).
 
-            This is more efficient than calling create_record multiple times
-            when you need to create many records of the same model.
+            More efficient than calling create_record multiple times.
 
             Args:
                 model: The Odoo model name (e.g., 'project.task')
                 records: List of dictionaries, each containing field values for a record
+                lang: Optional one-shot language override (Odoo lang code).
 
             Returns:
-                Dictionary with creation results:
-                - success: Boolean indicating if creation succeeded
-                - created_count: Number of records created
-                - records: List of created records with id and display_name
-
-            Example:
-                # Create 3 tasks in a single call
-                create_records("project.task", [
-                    {"name": "Task 1", "project_id": 19},
-                    {"name": "Task 2", "project_id": 19},
-                    {"name": "Task 3", "project_id": 19}
-                ])
+                Dictionary with `success`, `created_count`, `records`.
             """
-            return await self._handle_create_records_tool(model, records, lang)
+            return await self._handle_create_records_tool(model, records, lang, ctx)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Update Record",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
         async def update_record(
             model: str,
             record_id: int,
             values: Dict[str, Any],
             lang: Optional[str] = None,
-        ) -> Dict[str, Any]:
+            ctx: Optional[Context] = None,
+        ) -> UpdateResult:
             """Update an existing record.
 
             Args:
@@ -612,44 +670,56 @@ class OdooToolHandler:
                     in a single call.
 
             Returns:
-                Dictionary with updated record details
+                Updated record details with confirmation.
             """
-            return await self._handle_update_record_tool(model, record_id, values, lang)
+            result = await self._handle_update_record_tool(model, record_id, values, lang, ctx)
+            return UpdateResult(**result)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Update Records (batch)",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
         async def update_records(
             model: str,
             record_ids: List[int],
             values: Dict[str, Any],
             lang: Optional[str] = None,
+            ctx: Optional[Context] = None,
         ) -> Dict[str, Any]:
             """Update multiple records with the same values (batch operation).
 
-            This is more efficient than calling update_record multiple times
-            when you need to apply the same changes to many records.
+            More efficient than calling update_record multiple times.
 
             Args:
                 model: The Odoo model name (e.g., 'project.task')
                 record_ids: List of record IDs to update
                 values: Field values to apply to all records
+                lang: Optional one-shot language override (Odoo lang code).
 
             Returns:
-                Dictionary with update confirmation:
-                - success: Boolean indicating if update succeeded
-                - updated_count: Number of records updated
-                - record_ids: List of updated record IDs
-
-            Example:
-                # Update 85 tasks in a single call
-                update_records("project.task", [1, 2, 3, ...], {"display_in_project": True})
+                Dictionary with `success`, `updated_count`, `record_ids`.
             """
-            return await self._handle_update_records_tool(model, record_ids, values, lang)
+            return await self._handle_update_records_tool(model, record_ids, values, lang, ctx)
 
-        @self.app.tool()
+        @self.app.tool(
+            title="Delete Record",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=False,
+            ),
+        )
         async def delete_record(
             model: str,
             record_id: int,
-        ) -> Dict[str, Any]:
+            ctx: Optional[Context] = None,
+        ) -> DeleteResult:
             """Delete a record.
 
             Args:
@@ -657,9 +727,242 @@ class OdooToolHandler:
                 record_id: The record ID to delete
 
             Returns:
-                Dictionary with deletion confirmation
+                Deletion confirmation with the deleted record's name and ID.
             """
-            return await self._handle_delete_record_tool(model, record_id)
+            result = await self._handle_delete_record_tool(model, record_id, ctx)
+            return DeleteResult(**result)
+
+        @self.app.tool(
+            title="Post Message",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def post_message(
+            model: str,
+            record_id: int,
+            body: str,
+            subtype: Literal["note", "comment"] = "note",
+            message_type: Literal["comment", "notification"] = "comment",
+            partner_ids: Optional[List[int]] = None,
+            attachment_ids: Optional[List[int]] = None,
+            body_is_html: bool = False,
+            ctx: Optional[Context] = None,
+        ) -> PostMessageResult:
+            """Post a message to an Odoo record's chatter (mail.thread).
+
+            ``subtype="note"`` (default) is an internal log; ``subtype="comment"``
+            notifies followers. Set ``body_is_html=True`` for HTML markup
+            (Odoo 17+ escapes str bodies otherwise).
+
+            Args:
+                model: Odoo model name (e.g., 'res.partner')
+                record_id: Record ID to post to
+                body: Message body (plain text by default; HTML if body_is_html=True)
+                subtype: 'note' (internal, default) or 'comment' (notifies followers)
+                message_type: 'comment' (default) or 'notification'
+                partner_ids: Optional list of res.partner IDs to additionally notify
+                attachment_ids: Optional list of existing ir.attachment IDs to link
+                body_is_html: Treat body as HTML rather than plain text (Odoo 17+)
+
+            Returns:
+                Confirmation with the new mail.message ID.
+            """
+            result = await self._handle_post_message_tool(
+                model,
+                record_id,
+                body,
+                subtype,
+                message_type,
+                partner_ids,
+                attachment_ids,
+                body_is_html,
+                ctx,
+            )
+            return PostMessageResult(**result)
+
+        @self.app.tool(
+            title="Aggregate Records",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=True,
+            ),
+        )
+        async def aggregate_records(
+            model: str,
+            groupby: List[str],
+            aggregates: Optional[List[str]] = None,
+            domain: Optional[Any] = None,
+            order: Optional[str] = None,
+            limit: Optional[int] = None,
+            offset: int = 0,
+            ctx: Optional[Context] = None,
+        ) -> AggregateResult:
+            """Aggregate records server-side via Odoo's grouping methods.
+
+            Use this tool whenever the question is "totals/counts/groupings",
+            not "list of records". It pushes the aggregation down to Odoo
+            instead of pulling raw records and reducing client-side.
+
+            Dispatches by Odoo version: ``formatted_read_group`` on 19+
+            (the new dedicated method), falls back to ``read_group`` on
+            older versions with response-shape normalization. Callers see
+            the same response shape on every supported version.
+
+            Args:
+                model: Odoo model name (e.g. 'sale.order')
+                groupby: One or more group expressions. Field names, optionally
+                    with a granularity suffix for date/datetime fields:
+                    ``["date_order:month"]``, ``["partner_id"]``,
+                    ``["partner_id", "date_order:year"]``.
+                aggregates: Aggregate expressions of the form ``"field:operator"``
+                    (sum, avg, min, max, count, count_distinct, array_agg, ...).
+                    Examples: ``["amount_total:sum"]``, ``["id:count"]``.
+                    If omitted or empty, defaults to ``["__count"]`` so each
+                    group carries a count. Pass ``["__count", "amount_total:sum"]``
+                    to get both.
+                domain: Odoo domain filter — list, JSON string, or None.
+                order: Sort expression over groupby keys / aggregates,
+                    e.g. ``"date_order:month"`` or ``"amount_total:sum desc"``.
+                limit: Maximum number of groups. Defaults to
+                    ``ODOO_MCP_DEFAULT_LIMIT``; capped at ``ODOO_MCP_MAX_LIMIT``.
+                offset: Number of groups to skip.
+
+            Returns:
+                ``AggregateResult`` with ``groups`` (list of dicts; each contains
+                the groupby keys, ``__count``, and any requested aggregates),
+                plus the echoed ``model``, ``groupby``, and ``aggregates``.
+
+            Examples:
+                # Sales by month
+                aggregate_records(
+                    "sale.order",
+                    groupby=["date_order:month"],
+                    aggregates=["amount_total:sum"],
+                    domain=[["state", "in", ["sale", "done"]]],
+                )
+
+                # Partner count by country
+                aggregate_records("res.partner", groupby=["country_id"])
+            """
+            result = await self._handle_aggregate_records_tool(
+                model, groupby, aggregates, domain, order, limit, offset, ctx
+            )
+            return AggregateResult(**result)
+
+        # Two-key opt-in: invisible to the client unless both flags are set.
+        if self.config.is_write_allowed and self.config.enable_method_calls:
+            logger.info("call_model_method tool ENABLED (full YOLO + ODOO_MCP_ENABLE_METHOD_CALLS)")
+
+            @self.app.tool(
+                title="Call Model Method",
+                annotations=ToolAnnotations(
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=True,
+                ),
+            )
+            async def call_model_method(
+                model: str,
+                method: str,
+                arguments: Optional[Union[List[Any], str]] = None,
+                keyword_arguments: Optional[Union[Dict[str, Any], str]] = None,
+                ctx: Optional[Context] = None,
+            ) -> CallModelMethodResult:
+                """Call a public Odoo model method via XML-RPC execute_kw.
+
+                Workflow escape hatch for actions not covered by CRUD: posting an
+                invoice (``account.move.action_post``), confirming a sale order
+                (``sale.order.action_confirm``), validating a picking, etc.
+
+                Available ONLY when the server runs with full YOLO and
+                ``ODOO_MCP_ENABLE_METHOD_CALLS=true``. Odoo still enforces record
+                rules and model ACLs for the authenticated user.
+
+                Args:
+                    model: Technical model name (e.g. ``account.move``).
+                    method: Public Python identifier. Dotted, dashed, whitespace,
+                        and ``_``-prefixed names are rejected.
+                    arguments: Positional argument list for ``execute_kw``, as a
+                        list or JSON-string. For recordset methods, the first
+                        element is typically the list of ids: ``[[42]]`` runs on
+                        id 42. Defaults to ``[]``.
+                    keyword_arguments: Optional dict (or JSON-object string) of
+                        keyword arguments for ``execute_kw`` (e.g. ``{"context": {...}}``).
+
+                Returns:
+                    ``CallModelMethodResult`` with the raw method return value in
+                    ``result`` (bool/dict/list/None depending on the method).
+
+                Prefer ``create_record`` / ``update_record`` / ``delete_record``
+                when sufficient.
+                """
+                result = await self._handle_call_model_method_tool(
+                    model, method, arguments, keyword_arguments, ctx
+                )
+                return CallModelMethodResult(**result)
+
+        @self.app.tool(
+            title="List Log Files",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def list_log_files(ctx: Optional[Context] = None) -> Dict[str, Any]:
+            """List Odoo / system log files visible to the server.
+
+            Requires the ``elevate_informatics_log_reader`` Odoo module to be
+            installed (https://github.com/elevateinformatics/elevate_informatics_log_reader).
+            Returns a clear error pointing to the install instructions when the
+            module is missing.
+
+            Returns:
+                Dict with ``files`` (each ``{path, size_bytes, mtime, readable,
+                is_configured_logfile}``), ``configured_logfile``, ``dirs_scanned``.
+            """
+            return await self._handle_list_log_files_tool(ctx)
+
+        @self.app.tool(
+            title="Tail Log",
+            annotations=ToolAnnotations(
+                readOnlyHint=True,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            ),
+        )
+        async def tail_logs(
+            path: Optional[str] = None,
+            lines: int = 200,
+            grep: Optional[str] = None,
+            ctx: Optional[Context] = None,
+        ) -> Dict[str, Any]:
+            """Return the last ``lines`` lines of an Odoo log file.
+
+            Requires the ``elevate_informatics_log_reader`` Odoo module
+            (https://github.com/elevateinformatics/elevate_informatics_log_reader).
+
+            Args:
+                path: Absolute path. ``None`` (default) → the active Odoo
+                    log file (``tools.config['logfile']``, typically
+                    ``~/logs/odoo.log`` on Odoo.sh).
+                lines: Number of trailing lines (1..5000).
+                grep: Optional substring filter applied after tailing.
+
+            Returns:
+                Dict with ``path``, ``lines``, ``count``, ``truncated``,
+                ``size_bytes``.
+            """
+            return await self._handle_tail_logs_tool(path, lines, grep, ctx)
 
         @self.app.tool()
         async def get_locale() -> Dict[str, Any]:
@@ -785,62 +1088,26 @@ class OdooToolHandler:
     async def _handle_search_tool(
         self,
         model: str,
-        domain: Optional[Union[str, List[Union[str, List[Any]]]]],
-        fields: Optional[List[str]],
-        limit: int,
+        domain: Optional[Any],
+        fields: Optional[Any],
+        limit: Optional[int],
         offset: int,
         order: Optional[str],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle search tool request."""
         try:
             with perf_logger.track_operation("tool_search", model=model):
                 # Check model access
                 self.access_controller.validate_model_access(model, "read")
+                await self._ctx_info(ctx, f"Searching {model}...")
 
                 # Ensure we're connected
                 if not self.connection.is_authenticated:
                     raise ValidationError("Not authenticated with Odoo")
 
-                # Handle domain parameter - can be string or list
-                parsed_domain = []
-                if domain is not None:
-                    if isinstance(domain, str):
-                        # Parse string to list
-                        try:
-                            # First try standard JSON parsing
-                            parsed_domain = json.loads(domain)
-                        except json.JSONDecodeError:
-                            # If that fails, try converting single quotes to double quotes
-                            # This handles Python-style domain strings
-                            try:
-                                # Replace single quotes with double quotes for valid JSON
-                                # But be careful not to replace quotes inside string values
-                                json_domain = domain.replace("'", '"')
-                                # Also need to ensure Python True/False are lowercase for JSON
-                                json_domain = json_domain.replace("True", "true").replace(
-                                    "False", "false"
-                                )
-                                parsed_domain = json.loads(json_domain)
-                            except json.JSONDecodeError as e:
-                                # If both attempts fail, try evaluating as Python literal
-                                try:
-                                    import ast
-
-                                    parsed_domain = ast.literal_eval(domain)
-                                except (ValueError, SyntaxError):
-                                    raise ValidationError(
-                                        f"Invalid domain parameter. Expected JSON array or Python list, got: {domain[:100]}..."
-                                    ) from e
-
-                        if not isinstance(parsed_domain, list):
-                            raise ValidationError(
-                                f"Domain must be a list, got {type(parsed_domain).__name__}"
-                            )
-                        logger.debug(f"Parsed domain from string: {parsed_domain}")
-                    else:
-                        # Already a list
-                        parsed_domain = domain
+                parsed_domain = self._parse_domain_input(domain)
 
                 # Handle fields parameter - can be string or list
                 parsed_fields = fields
@@ -868,13 +1135,20 @@ class OdooToolHandler:
                             ) from e
 
                 # Set defaults
-                if limit <= 0 or limit > self.config.max_limit:
+                if limit is None or limit <= 0:
                     limit = self.config.default_limit
+                elif limit > self.config.max_limit:
+                    limit = self.config.max_limit
 
-                # Get total count (only thread ``lang`` through when set so mocks
+                # Get total count (only thread `lang` through when set so mocks
                 # asserting on plain (model, domain) still match).
                 if lang:
                     total_count = self.connection.search_count(model, parsed_domain, lang=lang)
+                else:
+                    total_count = self.connection.search_count(model, parsed_domain)
+                await self._ctx_progress(ctx, 1, 3, f"Found {total_count} records")
+
+                if lang:
                     record_ids = self.connection.search(
                         model,
                         parsed_domain,
@@ -884,7 +1158,6 @@ class OdooToolHandler:
                         order=order,
                     )
                 else:
-                    total_count = self.connection.search_count(model, parsed_domain)
                     record_ids = self.connection.search(
                         model, parsed_domain, limit=limit, offset=offset, order=order
                     )
@@ -894,12 +1167,17 @@ class OdooToolHandler:
                 if parsed_fields is None:
                     # Use smart field selection to avoid serialization issues
                     fields_to_fetch = self._get_smart_default_fields(model)
+                    await self._ctx_info(ctx, f"Using smart field defaults for {model}")
                     logger.debug(
                         f"Using smart defaults for {model} search: {len(fields_to_fetch) if fields_to_fetch else 'all'} fields"
                     )
                 elif parsed_fields == ["__all__"]:
                     # Explicit request for all fields
                     fields_to_fetch = None  # Odoo interprets None as all fields
+                    await self._ctx_warning(
+                        ctx,
+                        f"Fetching ALL fields for {model} — may be slow or cause serialization errors",
+                    )
                     logger.debug(f"Fetching all fields for {model} search")
 
                 # Read records
@@ -913,6 +1191,7 @@ class OdooToolHandler:
                         records = self.connection.read(model, record_ids, fields_to_fetch)
                     # Process datetime fields in each record
                     records = [self._process_record_dates(record, model) for record in records]
+                await self._ctx_info(ctx, f"Returning {len(records)} records")
 
                 return {
                     "records": records,
@@ -923,13 +1202,13 @@ class OdooToolHandler:
                 }
 
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in search_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Search failed: {sanitized_msg}") from e
+            raise ValidationError(f"Search failed: {sanitized_msg}") from e
 
     async def _handle_get_record_tool(
         self,
@@ -937,12 +1216,14 @@ class OdooToolHandler:
         record_id: int,
         fields: Optional[List[str]],
         lang: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        ctx=None,
+    ) -> RecordResult:
         """Handle get record tool request."""
         try:
             with perf_logger.track_operation("tool_get_record", model=model):
                 # Check model access
                 self.access_controller.validate_model_access(model, "read")
+                await self._ctx_info(ctx, f"Getting {model}/{record_id}...")
 
                 # Ensure we're connected
                 if not self.connection.is_authenticated:
@@ -952,17 +1233,20 @@ class OdooToolHandler:
                 fields_to_fetch = fields
                 use_smart_defaults = False
                 total_fields = None
+                field_selection_method = "explicit"
 
                 if fields is None:
                     # Use smart field selection
                     fields_to_fetch = self._get_smart_default_fields(model)
                     use_smart_defaults = True
+                    field_selection_method = "smart_defaults"
                     logger.debug(
                         f"Using smart defaults for {model}: {len(fields_to_fetch) if fields_to_fetch else 'all'} fields"
                     )
                 elif fields == ["__all__"]:
                     # Explicit request for all fields
                     fields_to_fetch = None  # Odoo interprets None as all fields
+                    field_selection_method = "all"
                     logger.debug(f"Fetching all fields for {model}")
                 else:
                     # Specific fields requested
@@ -975,47 +1259,41 @@ class OdooToolHandler:
                     records = self.connection.read(model, [record_id], fields_to_fetch)
 
                 if not records:
-                    raise ToolError(f"Record not found: {model} with ID {record_id}")
+                    raise ValidationError(f"Record not found: {model} with ID {record_id}")
 
                 # Process datetime fields in the record
                 record = self._process_record_dates(records[0], model)
 
-                # Add metadata when using smart defaults
+                # Build metadata when using smart defaults
+                metadata = None
                 if use_smart_defaults:
                     try:
-                        # Get total field count for metadata
                         all_fields_info = self.connection.fields_get(model)
                         total_fields = len(all_fields_info)
                     except Exception:
-                        pass  # Don't fail if we can't get field count
+                        pass
 
-                    record["_metadata"] = {
-                        "fields_returned": (
-                            len(record) - 1 if "_metadata" in record else len(record)
-                        ),
-                        "field_selection_method": "smart_defaults",
-                        "note": "Limited fields returned for performance. Use fields=['__all__'] for all fields or see odoo://{}/fields for available fields.".format(
-                            model
-                        ),
-                    }
-                    if total_fields:
-                        record["_metadata"]["total_fields_available"] = total_fields
+                    metadata = FieldSelectionMetadata(
+                        fields_returned=len(record),
+                        field_selection_method=field_selection_method,
+                        total_fields_available=total_fields,
+                        note=f"Limited fields returned for performance. Use fields=['__all__'] for all fields or see odoo://{model}/fields for available fields.",
+                    )
 
-                return record
+                return RecordResult(record=record, metadata=metadata)
 
-        except ToolError:
-            # Re-raise ToolError without modification to preserve specific error messages
+        except ValidationError:
             raise
         except NotFoundError as e:
-            raise ToolError(str(e)) from e
+            raise ValidationError(str(e)) from e
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in get_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to get record: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to get record: {sanitized_msg}") from e
 
     async def _handle_read_records_tool(
         self,
@@ -1023,6 +1301,7 @@ class OdooToolHandler:
         record_ids: List[int],
         fields: Optional[List[str]],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle read records (batch) tool request."""
         try:
@@ -1075,18 +1354,19 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in read_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to read records: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to read records: {sanitized_msg}") from e
 
-    async def _handle_list_models_tool(self) -> Dict[str, Any]:
+    async def _handle_list_models_tool(self, ctx=None) -> Dict[str, Any]:
         """Handle list models tool request with permissions."""
         try:
             with perf_logger.track_operation("tool_list_models"):
+                await self._ctx_info(ctx, "Listing available models...")
                 # Check if YOLO mode is enabled
                 if self.config.is_yolo_enabled:
                     # Query actual models from ir.model in YOLO mode
@@ -1123,6 +1403,10 @@ class OdooToolHandler:
                         # Prepare response with YOLO mode metadata
                         mode_desc = (
                             "READ-ONLY" if self.config.yolo_mode == "read" else "FULL ACCESS"
+                        )
+                        await self._ctx_info(
+                            ctx,
+                            f"YOLO mode ({mode_desc}): found {len(model_records)} models",
                         )
 
                         # Create metadata about YOLO mode
@@ -1186,6 +1470,8 @@ class OdooToolHandler:
                 models = self.access_controller.get_enabled_models()
 
                 # Enrich with permissions for each model
+                if models:
+                    await self._ctx_info(ctx, f"Enriching {len(models)} models...")
                 enriched_models = []
                 for model_info in models:
                     model_name = model_info["model"]
@@ -1220,17 +1506,17 @@ class OdooToolHandler:
 
                 # Return proper JSON structure with enriched models array
                 return {"models": enriched_models}
-        except ToolError:
-            # Re-raise ToolError without modification to preserve specific error messages
+        except ValidationError:
             raise
         except Exception as e:
             logger.error(f"Error in list_models tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to list models: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to list models: {sanitized_msg}") from e
 
-    async def _handle_list_resource_templates_tool(self) -> Dict[str, Any]:
+    async def _handle_list_resource_templates_tool(self, ctx=None) -> Dict[str, Any]:
         """Handle list resource templates tool request."""
         try:
+            await self._ctx_info(ctx, "Listing resource templates...")
             # Get list of enabled models that can be used with resources
             enabled_models = self.access_controller.get_enabled_models()
             model_names = [m["model"] for m in enabled_models if m.get("read", True)]
@@ -1283,19 +1569,21 @@ class OdooToolHandler:
         except Exception as e:
             logger.error(f"Error in list_resource_templates tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to list resource templates: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to list resource templates: {sanitized_msg}") from e
 
     async def _handle_create_record_tool(
         self,
         model: str,
         values: Dict[str, Any],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle create record tool request."""
         try:
             with perf_logger.track_operation("tool_create_record", model=model):
                 # Check model access
                 self.access_controller.validate_model_access(model, "create")
+                await self._ctx_info(ctx, f"Creating record in {model}...")
 
                 # Ensure we're connected
                 if not self.connection.is_authenticated:
@@ -1313,21 +1601,21 @@ class OdooToolHandler:
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
-                # Note: Only use 'id' and 'display_name' as they always exist
-                # 'name' field doesn't exist in all models (e.g., survey.survey uses 'title')
+                # Only use universally available fields — 'name' is missing from
+                # some models (e.g. survey.survey uses 'title').
                 essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
                 records = self.connection.read(model, [record_id], essential_fields)
                 if not records:
-                    raise ToolError(f"Failed to read created record: {model} with ID {record_id}")
+                    raise ValidationError(
+                        f"Failed to read created record: {model} with ID {record_id}"
+                    )
 
                 # Process dates in the minimal record
                 record = self._process_record_dates(records[0], model)
 
-                # Generate direct URL to the record in Odoo
-                base_url = self.config.url.rstrip("/")
-                record_url = f"{base_url}/web#id={record_id}&model={model}&view_type=form"
+                record_url = self.connection.build_record_url(model, record_id)
 
                 return {
                     "success": True,
@@ -1336,23 +1624,23 @@ class OdooToolHandler:
                     "message": f"Successfully created {model} record with ID {record_id}",
                 }
 
-        except ToolError:
-            # Re-raise ToolError without modification to preserve specific error messages
+        except ValidationError:
             raise
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in create_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to create record: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to create record: {sanitized_msg}") from e
 
     async def _handle_create_records_tool(
         self,
         model: str,
         records: List[Dict[str, Any]],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle create records (batch) tool request."""
         try:
@@ -1407,13 +1695,13 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in create_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to create records: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to create records: {sanitized_msg}") from e
 
     async def _handle_update_record_tool(
         self,
@@ -1421,12 +1709,14 @@ class OdooToolHandler:
         record_id: int,
         values: Dict[str, Any],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle update record tool request."""
         try:
             with perf_logger.track_operation("tool_update_record", model=model):
                 # Check model access
                 self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Updating {model}/{record_id}...")
 
                 # Ensure we're connected
                 if not self.connection.is_authenticated:
@@ -1449,21 +1739,21 @@ class OdooToolHandler:
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
-                # Note: Only use 'id' and 'display_name' as they always exist
-                # 'name' field doesn't exist in all models (e.g., survey.survey uses 'title')
+                # Only use universally available fields — 'name' is missing from
+                # some models (e.g. survey.survey uses 'title').
                 essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
                 records = self.connection.read(model, [record_id], essential_fields)
                 if not records:
-                    raise ToolError(f"Failed to read updated record: {model} with ID {record_id}")
+                    raise ValidationError(
+                        f"Failed to read updated record: {model} with ID {record_id}"
+                    )
 
                 # Process dates in the minimal record
                 record = self._process_record_dates(records[0], model)
 
-                # Generate direct URL to the record in Odoo
-                base_url = self.config.url.rstrip("/")
-                record_url = f"{base_url}/web#id={record_id}&model={model}&view_type=form"
+                record_url = self.connection.build_record_url(model, record_id)
 
                 return {
                     "success": success,
@@ -1472,19 +1762,18 @@ class OdooToolHandler:
                     "message": f"Successfully updated {model} record with ID {record_id}",
                 }
 
-        except ToolError:
-            # Re-raise ToolError without modification to preserve specific error messages
+        except ValidationError:
             raise
         except NotFoundError as e:
-            raise ToolError(str(e)) from e
+            raise ValidationError(str(e)) from e
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in update_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to update record: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to update record: {sanitized_msg}") from e
 
     async def _handle_update_records_tool(
         self,
@@ -1492,6 +1781,7 @@ class OdooToolHandler:
         record_ids: List[int],
         values: Dict[str, Any],
         lang: Optional[str] = None,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle update records (batch) tool request."""
         try:
@@ -1536,13 +1826,83 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in update_records tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to update records: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to update records: {sanitized_msg}") from e
+
+    # ------------------------------------------------------------------
+    # Log reader (companion module: elevate_informatics_log_reader)
+    # ------------------------------------------------------------------
+
+    LOG_READER_MODEL = "elevate.log.reader"
+    LOG_READER_INSTALL_HINT = (
+        "Install the Odoo module 'elevate_informatics_log_reader' "
+        "(https://github.com/elevateinformatics/elevate_informatics_log_reader) "
+        "and ensure the calling user has the 'Settings / Administration' group."
+    )
+
+    def _ensure_log_reader_available(self) -> None:
+        """Raise ValidationError with a helpful hint if the log reader model is missing."""
+        if not self.connection.is_authenticated:
+            raise ValidationError("Not authenticated with Odoo")
+        try:
+            existing = self.connection.search(
+                "ir.model", [("model", "=", self.LOG_READER_MODEL)], limit=1
+            )
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error while probing log reader: {e}") from e
+        if not existing:
+            raise ValidationError(
+                f"Model '{self.LOG_READER_MODEL}' not found on this Odoo. "
+                f"{self.LOG_READER_INSTALL_HINT}"
+            )
+
+    async def _handle_list_log_files_tool(self, ctx=None) -> Dict[str, Any]:
+        """Delegate to elevate.log.reader.list_files()."""
+        try:
+            with perf_logger.track_operation("tool_list_log_files"):
+                self._ensure_log_reader_available()
+                await self._ctx_info(ctx, "Listing Odoo log files...")
+                return self.connection.execute_kw(self.LOG_READER_MODEL, "list_files", [], {})
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in list_log_files tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to list log files: {sanitized_msg}") from e
+
+    async def _handle_tail_logs_tool(
+        self,
+        path: Optional[str],
+        lines: int,
+        grep: Optional[str],
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Delegate to elevate.log.reader.tail()."""
+        try:
+            with perf_logger.track_operation("tool_tail_logs"):
+                self._ensure_log_reader_available()
+                kwargs: Dict[str, Any] = {"lines": lines}
+                if path is not None:
+                    kwargs["path"] = path
+                if grep is not None:
+                    kwargs["grep"] = grep
+                await self._ctx_info(ctx, f"Tailing log{f' {path}' if path else ' (default)'}...")
+                return self.connection.execute_kw(self.LOG_READER_MODEL, "tail", [], kwargs)
+        except ValidationError:
+            raise
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in tail_logs tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to tail log: {sanitized_msg}") from e
 
     async def _handle_get_locale_tool(self) -> Dict[str, Any]:
         """Handle get_locale tool request."""
@@ -1564,11 +1924,11 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in get_locale tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to get locale: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to get locale: {sanitized_msg}") from e
 
     async def _handle_set_locale_tool(self, lang: Optional[str]) -> Dict[str, Any]:
         """Handle set_locale tool request."""
@@ -1617,11 +1977,11 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in set_locale tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to set locale: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to set locale: {sanitized_msg}") from e
 
     async def _handle_get_field_translations_tool(
         self,
@@ -1661,13 +2021,13 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in get_field_translations tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to get field translations: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to get field translations: {sanitized_msg}") from e
 
     async def _handle_update_field_translations_tool(
         self,
@@ -1720,40 +2080,40 @@ class OdooToolHandler:
         except ValidationError:
             raise
         except NotFoundError as e:
-            raise ToolError(str(e)) from e
+            raise ValidationError(str(e)) from e
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in update_field_translations tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to update field translations: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to update field translations: {sanitized_msg}") from e
 
     async def _handle_delete_record_tool(
         self,
         model: str,
         record_id: int,
+        ctx=None,
     ) -> Dict[str, Any]:
         """Handle delete record tool request."""
         try:
             with perf_logger.track_operation("tool_delete_record", model=model):
                 # Check model access
                 self.access_controller.validate_model_access(model, "unlink")
+                await self._ctx_info(ctx, f"Deleting {model}/{record_id}...")
 
                 # Ensure we're connected
                 if not self.connection.is_authenticated:
                     raise ValidationError("Not authenticated with Odoo")
 
-                # Check if record exists
-                existing = self.connection.read(model, [record_id])
+                # Check if record exists and get display info
+                existing = self.connection.read(model, [record_id], ["id", "display_name"])
                 if not existing:
                     raise NotFoundError(f"Record not found: {model} with ID {record_id}")
 
                 # Store some info about the record before deletion
-                record_name = existing[0].get(
-                    "name", existing[0].get("display_name", f"ID {record_id}")
-                )
+                record_name = existing[0].get("display_name", f"ID {record_id}")
 
                 # Delete the record
                 success = self.connection.unlink(model, [record_id])
@@ -1765,19 +2125,386 @@ class OdooToolHandler:
                     "message": f"Successfully deleted {model} record '{record_name}' (ID: {record_id})",
                 }
 
-        except ToolError:
-            # Re-raise ToolError without modification to preserve specific error messages
+        except ValidationError:
             raise
         except NotFoundError as e:
-            raise ToolError(str(e)) from e
+            raise ValidationError(str(e)) from e
         except AccessControlError as e:
-            raise ToolError(f"Access denied: {e}") from e
+            raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
-            raise ToolError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Error in delete_record tool: {e}")
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ToolError(f"Failed to delete record: {sanitized_msg}") from e
+            raise ValidationError(f"Failed to delete record: {sanitized_msg}") from e
+
+    async def _handle_post_message_tool(
+        self,
+        model: str,
+        record_id: int,
+        body: str,
+        subtype: str,
+        message_type: str,
+        partner_ids: Optional[List[int]],
+        attachment_ids: Optional[List[int]],
+        body_is_html: bool,
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle post message tool request."""
+        subtype_xmlid_map = {
+            "note": "mail.mt_note",
+            "comment": "mail.mt_comment",
+        }
+        try:
+            with perf_logger.track_operation("tool_post_message", model=model):
+                # Check model access — message_post mutates the record
+                self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Posting message to {model}/{record_id}...")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate body before any XML-RPC call
+                if not body or not body.strip():
+                    raise ValidationError("body must not be empty")
+
+                # Build kwargs — omit partner_ids/attachment_ids when None
+                # (empty list means "clear all" in some Odoo contexts)
+                kwargs: Dict[str, Any] = {
+                    "body": body,
+                    "message_type": message_type,
+                    "subtype_xmlid": subtype_xmlid_map[subtype],
+                }
+                if partner_ids is not None:
+                    kwargs["partner_ids"] = partner_ids
+                if attachment_ids is not None:
+                    kwargs["attachment_ids"] = attachment_ids
+                if body_is_html:
+                    # Odoo 19 escapes any plain str body — opt-in flag preserves HTML
+                    kwargs["body_is_html"] = True
+
+                # Call message_post; translate the "no mail.thread" error before
+                # the outer ladder turns it into a generic "Connection error".
+                try:
+                    raw = self.connection.execute_kw(model, "message_post", [record_id], kwargs)
+                except OdooConnectionError as e:
+                    err_msg = str(e)
+                    if "message_post" in err_msg and (
+                        "has no attribute" in err_msg
+                        or "AttributeError" in err_msg
+                        or "does not exist" in err_msg
+                    ):
+                        raise ValidationError(
+                            f"Model '{model}' does not support chatter "
+                            "(no mail.thread inheritance)."
+                        ) from e
+                    raise
+
+                # Coerce return value to int message_id
+                if isinstance(raw, bool) or raw is None:
+                    raise ValidationError(f"Unexpected return from message_post: {raw!r}")
+                if isinstance(raw, int):
+                    message_id = raw
+                elif isinstance(raw, list) and raw and isinstance(raw[0], int):
+                    message_id = raw[0]
+                else:
+                    raise ValidationError(f"Unexpected return from message_post: {raw!r}")
+
+                return {
+                    "success": True,
+                    "message_id": message_id,
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in post_message tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to post message: {sanitized_msg}") from e
+
+    # Metadata keys we always preserve in normalized read_group output.
+    # Anything else not in the requested groupby/aggregates is filtered
+    # out — read_group with empty ``fields=`` defaults to ALL aggregator
+    # fields on the model, which leaks unrelated numeric fields.
+    _READ_GROUP_META_KEYS = frozenset({"__count", "__extra_domain", "__range", "__fold"})
+
+    def _call_read_group_normalized(
+        self,
+        model: str,
+        domain: List[Any],
+        groupby: List[str],
+        aggregates: List[str],
+        order: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        """Call legacy ``read_group`` and normalize its response shape.
+
+        Odoo < 19 doesn't have ``formatted_read_group``. ``read_group`` is
+        the long-standing alternative; with ``lazy=False`` its response is
+        already close to the v19 shape. Three normalizations:
+
+        * ``__domain`` → ``__extra_domain`` (key rename, per v19 convention).
+        * Aggregate keys: read_group emits aggregate values keyed by the
+          bare field name (e.g. ``"id:count"`` is returned as ``"id"``);
+          rename back to ``"field:op"`` to match v19.
+        * Bucket key whitelist: drop fields the caller didn't request.
+          read_group with empty ``fields=`` returns all aggregator fields
+          on the model (e.g. ``message_bounce``, ``partner_latitude``);
+          formatted_read_group never does that. Filter to keep only what
+          the caller asked for plus metadata keys (``__count``, etc.).
+
+        Translates kwargs:
+            * ``aggregates`` → ``fields`` (drop ``__count``; read_group emits
+              it implicitly when ``lazy=False``).
+            * ``order`` → ``orderby`` (omit entirely when ``None`` so
+              read_group uses its default).
+        """
+        # __count is implicit in read_group; passing it as a field raises a fault.
+        fields_kwarg = [a for a in aggregates if a != "__count"]
+
+        kwargs: Dict[str, Any] = {
+            "fields": fields_kwarg,
+            "groupby": groupby,
+            "limit": limit,
+            "offset": offset,
+            "lazy": False,
+        }
+        if order is not None:
+            kwargs["orderby"] = order
+
+        groups = self.connection.execute_kw(model, "read_group", [domain], kwargs)
+
+        # Aggregate key rename: build a list of (bare_field, full_expr)
+        # pairs to restore after read_group strips the operator suffix.
+        # Skip aggregates whose bare field collides with a groupby key —
+        # the groupby value already lives under that key.
+        groupby_field_names = {g.split(":", 1)[0] for g in groupby}
+        agg_renames = [
+            (a.split(":", 1)[0], a)
+            for a in fields_kwarg
+            if ":" in a and a.split(":", 1)[0] not in groupby_field_names
+        ]
+
+        # Whitelist of keys allowed in the final bucket: groupby specs +
+        # requested aggregates (post-rename) + known metadata keys.
+        allowed_keys = self._READ_GROUP_META_KEYS | set(groupby) | set(fields_kwarg)
+
+        normalized: List[Dict[str, Any]] = []
+        for bucket in groups:
+            if "__domain" in bucket:
+                bucket["__extra_domain"] = bucket.pop("__domain")
+            for bare, full in agg_renames:
+                if bare in bucket and full != bare:
+                    bucket[full] = bucket.pop(bare)
+            normalized.append({k: v for k, v in bucket.items() if k in allowed_keys})
+        return normalized
+
+    async def _handle_aggregate_records_tool(
+        self,
+        model: str,
+        groupby: List[str],
+        aggregates: Optional[List[str]],
+        domain: Optional[Any],
+        order: Optional[str],
+        limit: Optional[int],
+        offset: int,
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle aggregate_records tool request."""
+        try:
+            with perf_logger.track_operation("tool_aggregate_records", model=model):
+                # Access check (read permission — same as search_records)
+                self.access_controller.validate_model_access(model, "read")
+                await self._ctx_info(ctx, f"Aggregating {model}...")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Validate groupby — empty groupby collapses to a single
+                # bucket, which search_count already covers.
+                if not groupby:
+                    raise ValidationError(
+                        "groupby must not be empty (use search_count for an unfiltered total)."
+                    )
+
+                parsed_domain = self._parse_domain_input(domain)
+
+                # Limit defaults & capping (mirror search_records)
+                if limit is None or limit <= 0:
+                    limit = self.config.default_limit
+                elif limit > self.config.max_limit:
+                    limit = self.config.max_limit
+
+                # Default to ['__count'] when caller omits aggregates —
+                # otherwise formatted_read_group returns only the groupby
+                # keys with no quantitative data, which defeats the tool.
+                effective_aggregates = aggregates if aggregates else ["__count"]
+
+                # Version dispatch: formatted_read_group is Odoo 19+ only;
+                # fall back to read_group with response normalization on
+                # older versions. When the version is unknown (None), assume
+                # newer and let the XML-RPC fault surface — the caller can
+                # set ODOO_DB or check the connection log.
+                major = self.connection.get_major_version()
+                if major is not None and major < 19:
+                    groups = self._call_read_group_normalized(
+                        model, parsed_domain, groupby, effective_aggregates, order, limit, offset
+                    )
+                else:
+                    kwargs: Dict[str, Any] = {
+                        "groupby": groupby,
+                        "aggregates": effective_aggregates,
+                        "limit": limit,
+                        "offset": offset,
+                    }
+                    if order is not None:
+                        kwargs["order"] = order
+                    groups = self.connection.execute_kw(
+                        model, "formatted_read_group", [parsed_domain], kwargs
+                    )
+
+                await self._ctx_info(ctx, f"Returning {len(groups)} groups")
+
+                return {
+                    "groups": groups,
+                    "model": model,
+                    "groupby": groupby,
+                    "aggregates": effective_aggregates,
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in aggregate_records tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Aggregation failed: {sanitized_msg}") from e
+
+    @staticmethod
+    def _parse_execute_kw_arguments(value: Optional[Any]) -> List[Any]:
+        """Coerce the ``arguments`` parameter to a list (JSON-only)."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid arguments parameter. Expected JSON array, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, list):
+                raise ValidationError(f"arguments must be a list, got {type(parsed).__name__}")
+            return parsed
+        raise ValidationError(
+            f"arguments must be a list or JSON-string, got {type(value).__name__}"
+        )
+
+    @staticmethod
+    def _parse_execute_kw_kwargs(value: Optional[Any]) -> Dict[str, Any]:
+        """Coerce the ``keyword_arguments`` parameter to a dict (JSON-only)."""
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            if len(value) > _MAX_JSON_PARAM_BYTES:
+                raise ValidationError(
+                    f"keyword_arguments JSON-string exceeds {_MAX_JSON_PARAM_BYTES} bytes"
+                )
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                raise ValidationError(
+                    f"Invalid keyword_arguments parameter. Expected JSON object, got: {value[:100]}"
+                ) from e
+            if not isinstance(parsed, dict):
+                raise ValidationError(
+                    f"keyword_arguments must be a dict, got {type(parsed).__name__}"
+                )
+            return parsed
+        raise ValidationError(
+            f"keyword_arguments must be a dict or JSON-string, got {type(value).__name__}"
+        )
+
+    async def _handle_call_model_method_tool(
+        self,
+        model: str,
+        method: str,
+        arguments: Optional[Any],
+        keyword_arguments: Optional[Any],
+        ctx=None,
+    ) -> Dict[str, Any]:
+        """Handle call_model_method tool request."""
+        try:
+            with perf_logger.track_operation("tool_call_model_method", model=model):
+                model = (model or "").strip()
+                method = (method or "").strip()
+                if not model:
+                    raise ValidationError("model must not be empty")
+                if not method:
+                    raise ValidationError("method must not be empty")
+                if not _PUBLIC_METHOD_RE.fullmatch(method):
+                    raise ValidationError(
+                        f"Refusing to call '{method}': only public ASCII Python "
+                        "identifiers are accepted; dotted, dashed, whitespace, "
+                        "non-ASCII, and _-prefixed names are rejected."
+                    )
+
+                # No-op under full YOLO; placeholder if the gate ever loosens.
+                self.access_controller.validate_model_access(model, "write")
+                await self._ctx_info(ctx, f"Calling {model}.{method}(...)")
+
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                args_list = self._parse_execute_kw_arguments(arguments)
+                kwargs_dict = self._parse_execute_kw_kwargs(keyword_arguments)
+
+                # Audit only what was called, not the values — kwargs may carry PII.
+                logger.info(
+                    "call_model_method invoked: model=%s method=%s args_len=%d kwargs_keys=%s",
+                    model,
+                    method,
+                    len(args_list),
+                    sorted(kwargs_dict.keys()),
+                )
+
+                rpc_result = self.connection.execute_kw(model, method, args_list, kwargs_dict)
+
+                # Workflow methods mutate state; flush the model's cache.
+                self.connection.performance_manager.invalidate_record_cache(model)
+
+                return {
+                    "success": True,
+                    "result": _json_safe(rpc_result),
+                    "message": f"Successfully called {model}.{method}",
+                }
+
+        except ValidationError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in call_model_method tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to call model method: {sanitized_msg}") from e
 
 
 def register_tools(

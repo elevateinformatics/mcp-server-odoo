@@ -17,7 +17,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from xmlrpc.client import SafeTransport, ServerProxy, Transport
 
 from .config import OdooConfig
@@ -26,106 +26,60 @@ from .logging_config import get_logger
 logger = get_logger(__name__)
 
 
-class GzipTransport(Transport):
-    """XML-RPC Transport with gzip response decompression support.
+def _gzip_request(self, host, handler, request_body, verbose=False):
+    """Shared XML-RPC request impl with gzip response support + Odoo DB header."""
+    headers = [
+        ("Content-Type", "text/xml"),
+        ("Accept-Encoding", "gzip, deflate"),
+    ]
 
-    Sends Accept-Encoding: gzip header and handles gzip responses.
-    Note: Request compression is not used as Odoo doesn't support it.
-    """
+    connection = self.make_connection(host)
 
-    def request(self, host, handler, request_body, verbose=False):
-        """Send XML-RPC request with gzip response support."""
-        headers = [
-            ("Content-Type", "text/xml"),
-            ("Accept-Encoding", "gzip, deflate"),
-        ]
+    try:
+        connection.putrequest("POST", handler)
+        for header, value in headers:
+            connection.putheader(header, value)
+        connection.putheader("Content-Length", str(len(request_body)))
+        # Multi-DB routing: inject X-Odoo-Database when set on the transport.
+        database = getattr(self, "database", None)
+        if database:
+            connection.putheader("X-Odoo-Database", database)
+        connection.endheaders(request_body)
 
-        # Use parent's connection handling
-        connection = self.make_connection(host)
+        response = connection.getresponse()
 
-        try:
-            connection.putrequest("POST", handler)
-            for header, value in headers:
-                connection.putheader(header, value)
-            connection.putheader("Content-Length", str(len(request_body)))
-            connection.endheaders(request_body)
+        if response.status != 200:
+            raise http.client.HTTPException(f"HTTP error: {response.status} {response.reason}")
 
-            response = connection.getresponse()
+        response_data = response.read()
+        content_encoding = response.getheader("Content-Encoding", "").lower()
+        if "gzip" in content_encoding:
+            response_data = gzip.decompress(response_data)
 
-            if response.status != 200:
-                raise http.client.HTTPException(f"HTTP error: {response.status} {response.reason}")
-
-            # Handle gzip response
-            response_data = response.read()
-            content_encoding = response.getheader("Content-Encoding", "").lower()
-            if "gzip" in content_encoding:
-                response_data = gzip.decompress(response_data)
-
-            return self.parse_response(response_data)
-
-        except Exception:
-            connection.close()
-            raise
-
-    def parse_response(self, response_data):
-        """Parse XML-RPC response from bytes."""
         from xmlrpc.client import getparser
 
         p, u = getparser()
         p.feed(response_data)
         p.close()
         return u.close()
+
+    except Exception:
+        connection.close()
+        raise
+
+
+class GzipTransport(Transport):
+    """XML-RPC Transport: gzip response decompression. Request compression
+    is NOT used because Odoo does not accept gzipped request bodies.
+    """
+
+    request = _gzip_request
 
 
 class GzipSafeTransport(SafeTransport):
-    """XML-RPC SafeTransport with gzip response decompression for HTTPS.
+    """XML-RPC SafeTransport (HTTPS): gzip response decompression."""
 
-    Sends Accept-Encoding: gzip header and handles gzip responses.
-    Note: Request compression is not used as Odoo doesn't support it.
-    """
-
-    def request(self, host, handler, request_body, verbose=False):
-        """Send XML-RPC request with gzip response support over HTTPS."""
-        headers = [
-            ("Content-Type", "text/xml"),
-            ("Accept-Encoding", "gzip, deflate"),
-        ]
-
-        # Use parent's connection handling
-        connection = self.make_connection(host)
-
-        try:
-            connection.putrequest("POST", handler)
-            for header, value in headers:
-                connection.putheader(header, value)
-            connection.putheader("Content-Length", str(len(request_body)))
-            connection.endheaders(request_body)
-
-            response = connection.getresponse()
-
-            if response.status != 200:
-                raise http.client.HTTPException(f"HTTP error: {response.status} {response.reason}")
-
-            # Handle gzip response
-            response_data = response.read()
-            content_encoding = response.getheader("Content-Encoding", "").lower()
-            if "gzip" in content_encoding:
-                response_data = gzip.decompress(response_data)
-
-            return self.parse_response(response_data)
-
-        except Exception:
-            connection.close()
-            raise
-
-    def parse_response(self, response_data):
-        """Parse XML-RPC response from bytes."""
-        from xmlrpc.client import getparser
-
-        p, u = getparser()
-        p.feed(response_data)
-        p.close()
-        return u.close()
+    request = _gzip_request
 
 
 @dataclass
@@ -361,6 +315,22 @@ class Cache:
             self._remove(key, reason)
 
 
+class OdooTransport(GzipTransport):
+    """HTTP transport: gzip response decompression + X-Odoo-Database header."""
+
+    def __init__(self, database: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.database = database
+
+
+class OdooSafeTransport(GzipSafeTransport):
+    """HTTPS transport: gzip response decompression + X-Odoo-Database header."""
+
+    def __init__(self, database: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        self.database = database
+
+
 class ConnectionPool:
     """Thread-safe connection pool for XML-RPC connections."""
 
@@ -376,13 +346,14 @@ class ConnectionPool:
         self._connections: List[Tuple[ServerProxy, float]] = []
         self._endpoint_map: List[str] = []  # Track endpoints for each connection
         self._lock = threading.RLock()
-        # Use Gzip-enabled transports for compression support
-        # GzipSafeTransport for HTTPS, GzipTransport for HTTP
+        # Template — only its `database` field is read in get_connection. Per-proxy
+        # transport instances (set per ServerProxy below) avoid keep-alive races
+        # under concurrent tool calls. Both transports decompress gzip responses.
         if config.url.startswith("https://"):
-            self._transport = GzipSafeTransport()
+            self._transport: Union[OdooTransport, OdooSafeTransport] = OdooSafeTransport()
         else:
-            self._transport = GzipTransport()
-        logger.info("Connection pool initialized with gzip compression support")
+            self._transport = OdooTransport()
+        logger.info("Connection pool initialized with gzip + per-proxy transport")
         self._last_cleanup = time.time()
         self._stats = {
             "connections_created": 0,
@@ -433,7 +404,11 @@ class ConnectionPool:
                 self._endpoint_map.pop(0)
                 self._stats["connections_closed"] += 1
 
-            conn = ServerProxy(url, transport=self._transport, allow_none=True)
+            if self.config.url.startswith("https://"):
+                transport = OdooSafeTransport(database=self._transport.database)
+            else:
+                transport = OdooTransport(database=self._transport.database)
+            conn = ServerProxy(url, transport=transport, allow_none=True)
             self._connections.append((conn, now))
             self._endpoint_map.append(endpoint)
             self._stats["connections_created"] += 1
@@ -467,6 +442,21 @@ class ConnectionPool:
         """Get connection pool statistics."""
         with self._lock:
             return self._stats.copy()
+
+    def set_database(self, db_name: str) -> None:
+        """Set the database for X-Odoo-Database header and invalidate existing connections.
+
+        Args:
+            db_name: Database name to send in the header
+        """
+        with self._lock:
+            self._transport.database = db_name
+            # Invalidate existing connections — they were created without the header
+            self._stats["connections_closed"] += len(self._connections)
+            self._connections.clear()
+            self._endpoint_map.clear()
+            self._stats["active_connections"] = 0
+            logger.debug(f"Set database header to '{db_name}', cleared connection pool")
 
     def clear(self):
         """Clear all connections."""
@@ -514,7 +504,8 @@ class RequestOptimizer:
             usage = self._field_usage.get(model, {})
             if not usage:
                 # Return common fields if no usage data
-                return ["id", "name", "display_name"]
+                # Use only universally available fields (not all models have 'name')
+                return ["id", "display_name"]
 
             # Get top 20 most used fields
             sorted_fields = sorted(usage.items(), key=lambda x: x[1], reverse=True)
@@ -701,20 +692,20 @@ class PerformanceManager:
         model: str,
         record: Dict[str, Any],
         fields: Optional[List[str]] = None,
-        ttl_seconds: Optional[int] = None,
+        ttl_seconds: int = 300,
     ):
         """Cache record data.
-
-        NOTE: Record caching is disabled - always fetch fresh data from Odoo.
 
         Args:
             model: Model name
             record: Record data
             fields: Field list (for cache key)
-            ttl_seconds: Cache TTL (unused)
+            ttl_seconds: Cache TTL
         """
-        # Disabled: always fetch fresh data from Odoo
-        pass
+        record_id = record.get("id")
+        if record_id is not None:
+            key = self.cache_key("record", model=model, id=record_id, fields=fields)
+            self.record_cache.put(key, record, ttl_seconds=ttl_seconds)
 
     def invalidate_record_cache(self, model: str, record_id: Optional[int] = None):
         """Invalidate record cache.
@@ -798,6 +789,14 @@ class PerformanceManager:
             "connection_pool": self.connection_pool.get_stats(),
             "performance": self.monitor.get_stats(),
         }
+
+    def set_database(self, db_name: str) -> None:
+        """Set the database for X-Odoo-Database header on the connection pool.
+
+        Args:
+            db_name: Database name to send in the header
+        """
+        self.connection_pool.set_database(db_name)
 
     def clear_all_caches(self):
         """Clear all caches."""

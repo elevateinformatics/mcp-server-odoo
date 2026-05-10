@@ -1,14 +1,13 @@
 """Helper utilities for MCP server testing."""
 
 import contextlib
-import json
 import logging
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional, Tuple
+from typing import Any, Dict, Generator, Optional
 
 import requests
 
@@ -88,8 +87,12 @@ class MCPTestServer:
             text=True,
         )
 
-        # Wait for server to start
-        time.sleep(2)
+        # Wait for server to initialize (stdio — no port to poll)
+        time.sleep(0.5)
+
+        if self.server_process.poll() is not None:
+            stdout, stderr = self.server_process.communicate()
+            raise RuntimeError(f"Server crashed on startup:\nstdout: {stdout}\nstderr: {stderr}")
 
         return self.server_process
 
@@ -173,16 +176,26 @@ def validate_mcp_response(response: Dict[str, Any]) -> bool:
     return False
 
 
-def check_odoo_health(base_url: str, api_key: str) -> bool:
-    """Check if Odoo MCP endpoints are healthy."""
+def check_odoo_health(base_url: str, api_key: str, database: str | None = None) -> bool:
+    """Check if Odoo MCP endpoints are healthy.
+
+    Args:
+        base_url: Odoo server URL
+        api_key: API key to validate
+        database: Database name for X-Odoo-Database header (needed for multi-DB)
+    """
     try:
+        db_headers: dict[str, str] = {}
+        if database:
+            db_headers["X-Odoo-Database"] = database
+
         # Check health endpoint
-        response = requests.get(f"{base_url}/mcp/health", timeout=5)
+        response = requests.get(f"{base_url}/mcp/health", headers=db_headers, timeout=5)
         if response.status_code != 200:
             return False
 
         # Check auth endpoint (it's a GET endpoint)
-        headers = {"X-API-Key": api_key}
+        headers = {"X-API-Key": api_key, **db_headers}
         response = requests.get(f"{base_url}/mcp/auth/validate", headers=headers, timeout=5)
 
         if response.status_code == 200:
@@ -194,101 +207,6 @@ def check_odoo_health(base_url: str, api_key: str) -> bool:
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         return False
-
-
-async def run_mcp_command(
-    server: OdooMCPServer, command: str, params: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Run an MCP command and return the response.
-
-    This simulates MCP protocol commands for testing purposes.
-    In production, these would be handled via stdio protocol.
-    """
-    # For now, we'll simulate the responses based on the registered resources
-    # In the actual implementation, FastMCP handles this via stdio
-
-    if command == "resources/list":
-        # Get list of available resources from the server's FastMCP app
-        resources = []
-        if hasattr(server, "resource_handler") and server.resource_handler:
-            # Add schema resources
-            for operation in ["record", "search", "browse", "count", "fields"]:
-                resources.append(
-                    {
-                        "uri": f"odoo://schema/{operation}",
-                        "name": f"{operation.capitalize()} operation schema",
-                        "mimeType": "application/json",
-                    }
-                )
-        return {"result": {"resources": resources}}
-
-    elif command.startswith("resources/read"):
-        # Simulate reading a resource
-        uri = params.get("uri", "")
-
-        # Simulate error cases
-        if "invalid.model" in uri:
-            return {
-                "error": {
-                    "code": -32602,
-                    "message": "Model 'invalid.model' not found or access denied",
-                }
-            }
-
-        if "ir.config_parameter" in uri:
-            return {
-                "error": {"code": -32602, "message": "Access denied to model 'ir.config_parameter'"}
-            }
-
-        # Handle invalid URI formats
-        if not uri.startswith("odoo://"):
-            return {"error": {"code": -32602, "message": "Invalid URI format"}}
-
-        # Handle empty URI path
-        if uri == "odoo://":
-            return {
-                "error": {"code": -32602, "message": "Invalid URI: missing model and operation"}
-            }
-
-        # Handle invalid operations
-        if "/invalid_operation" in uri:
-            return {"error": {"code": -32602, "message": "Invalid operation: invalid_operation"}}
-
-        # Handle invalid parameters
-        if "invalid_param=" in uri:
-            return {"error": {"code": -32602, "message": "Invalid parameter in URI"}}
-
-        # For testing, return mock data based on URI pattern
-        if uri.startswith("odoo://schema/"):
-            operation = uri.split("/")[-1]
-            schema = {
-                "operation": operation,
-                "parameters": {},
-                "description": f"Schema for {operation} operation",
-            }
-            return {
-                "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "application/json",
-                            "text": json.dumps(schema, indent=2),
-                        }
-                    ]
-                }
-            }
-        else:
-            # For other resources, return mock data
-            return {
-                "result": {
-                    "contents": [
-                        {"uri": uri, "mimeType": "text/plain", "text": f"Mock data for {uri}"}
-                    ]
-                }
-            }
-
-    else:
-        return {"error": {"code": -32601, "message": f"Unknown command: {command}"}}
 
 
 class PerformanceTimer:
@@ -327,32 +245,6 @@ def assert_performance(operation: str, duration: float, max_duration: float) -> 
         )
 
 
-async def validate_resource_operation(
-    server: OdooMCPServer, uri: str, expected_type: str = "text/plain"
-) -> Tuple[bool, Optional[str]]:
-    """Validate a resource operation and return success status and any error."""
-    try:
-        response = await run_mcp_command(server, "resources/read", {"uri": uri})
-
-        if "error" in response:
-            return False, response["error"]["message"]
-
-        result = response.get("result", {})
-
-        # Validate response structure
-        if not isinstance(result.get("contents", []), list):
-            return False, "Invalid contents structure"
-
-        for content in result["contents"]:
-            if content.get("mimeType") != expected_type:
-                return False, f"Expected {expected_type}, got {content.get('mimeType')}"
-
-        return True, None
-
-    except Exception as e:
-        return False, str(e)
-
-
 def create_test_env_file(test_dir: Path) -> Path:
     """Create a test .env file with server configuration."""
     import os
@@ -363,15 +255,21 @@ def create_test_env_file(test_dir: Path) -> Path:
     if not os.getenv("ODOO_URL"):
         raise ValueError("ODOO_URL environment variable not set. Please configure .env file.")
 
-    if not os.getenv("ODOO_API_KEY"):
-        raise ValueError("ODOO_API_KEY environment variable not set. Please configure .env file.")
+    if not os.getenv("ODOO_API_KEY") and not os.getenv("ODOO_PASSWORD"):
+        raise ValueError("Neither ODOO_API_KEY nor ODOO_PASSWORD set. Please configure .env file.")
 
-    env_content = f"""
-ODOO_URL={os.getenv("ODOO_URL")}
-ODOO_API_KEY={os.getenv("ODOO_API_KEY")}
-ODOO_DATABASE={os.getenv("ODOO_DB")}
-ODOO_MCP_LOG_LEVEL={os.getenv("ODOO_MCP_LOG_LEVEL", "INFO")}
-"""
+    lines = [
+        f"ODOO_URL={os.getenv('ODOO_URL')}",
+        f"ODOO_DATABASE={os.getenv('ODOO_DB', '')}",
+        f"ODOO_MCP_LOG_LEVEL={os.getenv('ODOO_MCP_LOG_LEVEL', 'INFO')}",
+    ]
+    if os.getenv("ODOO_API_KEY"):
+        lines.append(f"ODOO_API_KEY={os.getenv('ODOO_API_KEY')}")
+    if os.getenv("ODOO_USER"):
+        lines.append(f"ODOO_USER={os.getenv('ODOO_USER')}")
+    if os.getenv("ODOO_PASSWORD"):
+        lines.append(f"ODOO_PASSWORD={os.getenv('ODOO_PASSWORD')}")
+    env_content = "\n".join(lines)
 
     env_file.write_text(env_content.strip())
     return env_file

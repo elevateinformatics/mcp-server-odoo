@@ -8,7 +8,8 @@ import json
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import Annotations
 
 from .access_control import AccessControlError, AccessController
 from .config import OdooConfig
@@ -26,11 +27,6 @@ from .uri_schema import (
 )
 
 logger = get_logger(__name__)
-
-# Legacy error type aliases for backward compatibility
-ResourceError = ValidationError
-ResourceNotFoundError = NotFoundError
-ResourcePermissionError = PermissionError
 
 
 class OdooResourceHandler:
@@ -59,6 +55,14 @@ class OdooResourceHandler:
         # Register resources
         self._register_resources()
 
+    async def _ctx_info(self, ctx, message: str):
+        """Send info to MCP client context if available."""
+        if ctx:
+            try:
+                await ctx.info(message)
+            except Exception:
+                logger.debug(f"Failed to send ctx info: {message}")
+
     def _register_resources(self):
         """Register all resource handlers with FastMCP."""
         # Note: FastMCP uses decorators to register resources.
@@ -71,8 +75,13 @@ class OdooResourceHandler:
         self._register_concrete_resources()
 
         # Register record retrieval resource handler
-        @self.app.resource("odoo://{model}/record/{record_id}")
-        async def get_record(model: str, record_id: str) -> str:
+        @self.app.resource(
+            "odoo://{model}/record/{record_id}",
+            title="Odoo Record",
+            description="Retrieve a specific record from an Odoo model by ID",
+            annotations=Annotations(audience=["assistant"], priority=0.5),
+        )
+        async def get_record(model: str, record_id: str, ctx: Optional[Context] = None) -> str:
             """Retrieve a specific record from Odoo.
 
             Args:
@@ -82,33 +91,50 @@ class OdooResourceHandler:
             Returns:
                 Formatted record data as text
             """
-            return await self._handle_record_retrieval(model, record_id)
+            return await self._handle_record_retrieval(model, record_id, ctx)
 
         # Register search resource (no parameters due to FastMCP limitations)
-        @self.app.resource("odoo://{model}/search")
-        async def search_records(model: str) -> str:
+        @self.app.resource(
+            "odoo://{model}/search",
+            title="Odoo Search",
+            description="Search records with default settings (first 10 records)",
+            annotations=Annotations(audience=["assistant"], priority=0.5),
+        )
+        async def search_records(model: str, ctx: Optional[Context] = None) -> str:
             """Search records with default settings.
 
             Returns first 10 records with all fields.
             For more control, use the search_records tool instead.
             """
+            await self._ctx_info(ctx, f"Searching {model} (default: first 10 records)...")
             return await self._handle_search(model, None, None, None, None, None)
 
         # Note: Browse resource removed due to FastMCP query parameter limitations
         # Use get_record multiple times or search_records tool instead
 
         # Register count resource (no parameters due to FastMCP limitations)
-        @self.app.resource("odoo://{model}/count")
-        async def count_records(model: str) -> str:
+        @self.app.resource(
+            "odoo://{model}/count",
+            title="Odoo Record Count",
+            description="Count all records in an Odoo model",
+            annotations=Annotations(audience=["assistant"], priority=0.3),
+        )
+        async def count_records(model: str, ctx: Optional[Context] = None) -> str:
             """Count all records in the model.
 
             For filtered counts, use the search_records tool with limit=0.
             """
+            await self._ctx_info(ctx, f"Counting {model} records...")
             return await self._handle_count(model, None)
 
         # Register fields resource
-        @self.app.resource("odoo://{model}/fields")
-        async def get_fields(model: str) -> str:
+        @self.app.resource(
+            "odoo://{model}/fields",
+            title="Odoo Field Definitions",
+            description="Get field definitions and metadata for an Odoo model",
+            annotations=Annotations(audience=["assistant"], priority=0.4),
+        )
+        async def get_fields(model: str, ctx: Optional[Context] = None) -> str:
             """Get field definitions for a model.
 
             Args:
@@ -117,6 +143,7 @@ class OdooResourceHandler:
             Returns:
                 Formatted field definitions and metadata
             """
+            await self._ctx_info(ctx, f"Getting field definitions for {model}...")
             return await self._handle_fields(model)
 
     def _register_concrete_resources(self):
@@ -130,7 +157,7 @@ class OdooResourceHandler:
         # FastMCP will handle them properly as templates
         pass
 
-    async def _handle_record_retrieval(self, model: str, record_id: str) -> str:
+    async def _handle_record_retrieval(self, model: str, record_id: str, ctx=None) -> str:
         """Handle record retrieval request.
 
         Args:
@@ -146,6 +173,7 @@ class OdooResourceHandler:
             ValidationError: For invalid inputs
         """
         context = ErrorContext(model=model, operation="get_record", record_id=record_id)
+        await self._ctx_info(ctx, f"Retrieving {model}/{record_id}...")
 
         logger.info(f"Retrieving record: {model}/{record_id}")
 
@@ -209,9 +237,7 @@ class OdooResourceHandler:
                 records = self.connection.read(model, record_ids)
 
             if not records:
-                raise ResourceNotFoundError(
-                    f"Record not found: {model} with ID {record_id} does not exist"
-                )
+                raise NotFoundError(f"Record not found: {model} with ID {record_id} does not exist")
 
             record = records[0]
 
@@ -221,15 +247,15 @@ class OdooResourceHandler:
             logger.info(f"Successfully retrieved record: {model}/{record_id}")
             return formatted_data
 
-        except (ResourceNotFoundError, ResourcePermissionError, ResourceError):
+        except (NotFoundError, PermissionError, ValidationError):
             # Re-raise our custom exceptions
             raise
         except OdooConnectionError as e:
             logger.error(f"Connection error retrieving {model}/{record_id}: {e}")
-            raise ResourceError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Unexpected error retrieving {model}/{record_id}: {e}")
-            raise ResourceError(f"Failed to retrieve record: {e}") from e
+            raise ValidationError(f"Failed to retrieve record: {e}") from e
 
     async def _handle_search(
         self,
@@ -254,8 +280,8 @@ class OdooResourceHandler:
             Formatted search results with pagination
 
         Raises:
-            ResourcePermissionError: If access is denied
-            ResourceError: For other errors
+            PermissionError: If access is denied
+            ValidationError: For other errors
         """
         logger.info(f"Searching {model} with domain={domain}, limit={limit}, offset={offset}")
 
@@ -265,11 +291,11 @@ class OdooResourceHandler:
                 self.access_controller.validate_model_access(model, "read")
             except AccessControlError as e:
                 logger.warning(f"Access denied for {model}.read: {e}")
-                raise ResourcePermissionError(f"Access denied: {e}") from e
+                raise PermissionError(f"Access denied: {e}") from e
 
             # Ensure we're connected
             if not self.connection.is_authenticated:
-                raise ResourceError("Not authenticated with Odoo")
+                raise ValidationError("Not authenticated with Odoo")
 
             # Parse parameters
             parsed_domain = self._parse_domain(domain)
@@ -313,15 +339,15 @@ class OdooResourceHandler:
             logger.info(f"Search completed: found {len(records)} of {total_count} records")
             return formatted_results
 
-        except (ResourcePermissionError, ResourceError):
+        except (PermissionError, ValidationError):
             # Re-raise our custom exceptions
             raise
         except OdooConnectionError as e:
             logger.error(f"Connection error searching {model}: {e}")
-            raise ResourceError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Unexpected error searching {model}: {e}")
-            raise ResourceError(f"Failed to search records: {e}") from e
+            raise ValidationError(f"Failed to search records: {e}") from e
 
     def _parse_domain(self, domain: Optional[str]) -> List[Any]:
         """Parse domain parameter from URL-encoded string.
@@ -494,8 +520,8 @@ class OdooResourceHandler:
             Formatted multiple record data
 
         Raises:
-            ResourcePermissionError: If access is denied
-            ResourceError: For other errors
+            PermissionError: If access is denied
+            ValidationError: For other errors
         """
         logger.info(f"Browsing {model} records with IDs: {ids}")
 
@@ -505,16 +531,16 @@ class OdooResourceHandler:
                 self.access_controller.validate_model_access(model, "read")
             except AccessControlError as e:
                 logger.warning(f"Access denied for {model}.read: {e}")
-                raise ResourcePermissionError(f"Access denied: {e}") from e
+                raise PermissionError(f"Access denied: {e}") from e
 
             # Ensure we're connected
             if not self.connection.is_authenticated:
-                raise ResourceError("Not authenticated with Odoo")
+                raise ValidationError("Not authenticated with Odoo")
 
             # Parse IDs
             id_list = self._parse_ids(ids)
             if not id_list:
-                raise ResourceError("No valid IDs provided")
+                raise ValidationError("No valid IDs provided")
 
             # Read records in batch with smart field selection to avoid serialization issues
             # Get field metadata to determine which fields to fetch
@@ -559,15 +585,15 @@ class OdooResourceHandler:
             logger.info(f"Browse completed: found {len(records)} of {len(id_list)} records")
             return formatted_results
 
-        except (ResourcePermissionError, ResourceError):
+        except (PermissionError, ValidationError):
             # Re-raise our custom exceptions
             raise
         except OdooConnectionError as e:
             logger.error(f"Connection error browsing {model}: {e}")
-            raise ResourceError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Unexpected error browsing {model}: {e}")
-            raise ResourceError(f"Failed to browse records: {e}") from e
+            raise ValidationError(f"Failed to browse records: {e}") from e
 
     async def _handle_count(self, model: str, domain: Optional[str]) -> str:
         """Handle count request with domain filtering.
@@ -580,8 +606,8 @@ class OdooResourceHandler:
             Formatted count result
 
         Raises:
-            ResourcePermissionError: If access is denied
-            ResourceError: For other errors
+            PermissionError: If access is denied
+            ValidationError: For other errors
         """
         logger.info(f"Counting {model} records with domain: {domain}")
 
@@ -591,11 +617,11 @@ class OdooResourceHandler:
                 self.access_controller.validate_model_access(model, "read")
             except AccessControlError as e:
                 logger.warning(f"Access denied for {model}.read: {e}")
-                raise ResourcePermissionError(f"Access denied: {e}") from e
+                raise PermissionError(f"Access denied: {e}") from e
 
             # Ensure we're connected
             if not self.connection.is_authenticated:
-                raise ResourceError("Not authenticated with Odoo")
+                raise ValidationError("Not authenticated with Odoo")
 
             # Parse domain
             parsed_domain = self._parse_domain(domain)
@@ -609,15 +635,15 @@ class OdooResourceHandler:
             logger.info(f"Count completed: {count} records match criteria")
             return formatted_result
 
-        except (ResourcePermissionError, ResourceError):
+        except (PermissionError, ValidationError):
             # Re-raise our custom exceptions
             raise
         except OdooConnectionError as e:
             logger.error(f"Connection error counting {model}: {e}")
-            raise ResourceError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Unexpected error counting {model}: {e}")
-            raise ResourceError(f"Failed to count records: {e}") from e
+            raise ValidationError(f"Failed to count records: {e}") from e
 
     async def _handle_fields(self, model: str) -> str:
         """Handle fields request for model introspection.
@@ -629,8 +655,8 @@ class OdooResourceHandler:
             Formatted field definitions
 
         Raises:
-            ResourcePermissionError: If access is denied
-            ResourceError: For other errors
+            PermissionError: If access is denied
+            ValidationError: For other errors
         """
         logger.info(f"Getting field definitions for {model}")
 
@@ -640,11 +666,11 @@ class OdooResourceHandler:
                 self.access_controller.validate_model_access(model, "read")
             except AccessControlError as e:
                 logger.warning(f"Access denied for {model}.read: {e}")
-                raise ResourcePermissionError(f"Access denied: {e}") from e
+                raise PermissionError(f"Access denied: {e}") from e
 
             # Ensure we're connected
             if not self.connection.is_authenticated:
-                raise ResourceError("Not authenticated with Odoo")
+                raise ValidationError("Not authenticated with Odoo")
 
             # Get field definitions
             fields = self.connection.fields_get(model)
@@ -655,15 +681,15 @@ class OdooResourceHandler:
             logger.info(f"Fields retrieved: {len(fields)} fields found")
             return formatted_result
 
-        except (ResourcePermissionError, ResourceError):
+        except (PermissionError, ValidationError):
             # Re-raise our custom exceptions
             raise
         except OdooConnectionError as e:
             logger.error(f"Connection error getting fields for {model}: {e}")
-            raise ResourceError(f"Connection error: {e}") from e
+            raise ValidationError(f"Connection error: {e}") from e
         except Exception as e:
             logger.error(f"Unexpected error getting fields for {model}: {e}")
-            raise ResourceError(f"Failed to get field definitions: {e}") from e
+            raise ValidationError(f"Failed to get field definitions: {e}") from e
 
     def _parse_ids(self, ids: str) -> List[int]:
         """Parse comma-separated IDs string.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-odoo-ei"
-version = "0.5.0"
+version = "0.7.0"
 description = "A Model Context Protocol server for Odoo ERP systems"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp>=1.9.4",
+    "mcp>=1.26.0,<2",
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
@@ -48,15 +48,13 @@ dev = [
     "pytest>=8.3.5",
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.1.1",
-    "mypy>=1.16.0",
-    "ruff>=0.11.12",
-    "black>=25.1.0",
-    "types-requests>=2.32.0",
+    "ty>=0.0.18",
+    "ruff>=0.15.2",
     "requests>=2.32.3",
 ]
 build = [
     "nuitka>=2.0",
-    "ordered-set>=4.1.0",  # Nuitka dependency for better performance
+    "ordered-set>=4.1.0",
 ]
 
 [project.scripts]
@@ -72,7 +70,12 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
 markers = [
-    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "asyncio: marks tests as async (managed by pytest-asyncio)",
+    "yolo: needs running Odoo instance (vanilla XML-RPC, no MCP module)",
+    "mcp: needs running Odoo with MCP module installed",
+]
+filterwarnings = [
+    "ignore:coroutine .* was never awaited:RuntimeWarning",
 ]
 
 [tool.coverage.run]
@@ -90,39 +93,20 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = false
-warn_unused_configs = true
-disallow_untyped_defs = false
-disallow_any_unimported = false
-ignore_missing_imports = true
-no_implicit_optional = false
-check_untyped_defs = false
-strict_optional = false
-allow_untyped_calls = true
-allow_incomplete_defs = true
-allow_untyped_globals = true
-allow_redefinition = true
-no_warn_no_return = true
-warn_unreachable = false
-# Disable specific error codes that are problematic
-disable_error_code = ["str-bytes-safe", "union-attr", "arg-type", "return-value", "assignment", "list-item", "var-annotated"]
-exclude = [
-    "venv/",
-    ".venv/",
-    "build/",
-    "dist/",
-]
+[tool.ty.environment]
+python-version = "3.10"
 
-[[tool.mypy.overrides]]
-module = "mcp.*"
-ignore_errors = true
+[tool.ty.src]
+include = ["mcp_server_odoo/"]
+exclude = ["venv/", ".venv/", "build/", "dist/"]
 
-[[tool.mypy.overrides]]
-module = "tests.*"
-disallow_untyped_defs = false
-ignore_errors = true
+[tool.ty.rules]
+possibly-unresolved-reference = "warn"
+invalid-argument-type = "ignore"
+invalid-parameter-default = "error"
+invalid-return-type = "warn"
+invalid-assignment = "warn"
+unresolved-attribute = "ignore"
 
 [tool.ruff]
 line-length = 100
@@ -131,6 +115,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "B", "Q"]
 ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
 
 [tool.black]
 line-length = 100

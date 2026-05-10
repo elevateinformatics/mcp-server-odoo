@@ -352,7 +352,7 @@ class TestConnectionConstants:
         assert any("Broken pipe" in e for e in errors)
 
 
-@pytest.mark.odoo_required
+@pytest.mark.mcp
 class TestReconnectIntegration:
     """Integration tests for reconnection with real Odoo server."""
 
