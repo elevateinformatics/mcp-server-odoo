@@ -206,10 +206,19 @@ jobs:
     name: MCP Integration Tests
     runs-on: ubuntu-latest
     needs: [lint, test]
-    # Skip for fork PRs — secrets (ODOO_APPS_PAT) are not available
+    # Requires the `ODOO_APPS_PAT` secret to clone the private upstream
+    # `ivnvxd/odoo-apps` repo (the MCP Odoo addon).
+    #
+    # Forks (including this one) skip the job: opt in by setting the repo
+    # variable `RUN_MCP_INTEGRATION=true` AND providing `ODOO_APPS_PAT` —
+    # either by using your own fork of the addon (override the `repository:`
+    # below) or after coordinating access with upstream.
     if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
-      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      vars.RUN_MCP_INTEGRATION == 'true'
+      && (
+        (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
+        || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      )
 
     services:
       postgres:
