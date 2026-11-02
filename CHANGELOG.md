@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ODOO_YOLO_FILE`**: path to a file holding `read` or `true` that overrides
+  `ODOO_YOLO` and is re-read on every access, so write access can be opened and
+  closed without reconnecting the MCP server. Honored only when the server
+  started in YOLO mode; a missing file keeps `ODOO_YOLO`, and an unreadable or
+  invalid file (including `off`) falls back to `read`.
+
 ### Fixed
 
 - **CI lint job**: pre-commit was running `black` while CI runs `ruff format` —
