@@ -52,6 +52,43 @@ class TestYoloModeFile:
         assert not config.is_write_allowed
         assert config.is_yolo_enabled
 
+    def test_utf16_file_falls_back_to_read_without_raising(self, tmp_path):
+        level = tmp_path / "level"
+        level.write_bytes("true".encode("utf-16"))  # what PowerShell 5 `>` writes
+        config = _config("true", level)
+        assert config.yolo_mode == "read"
+
+    def test_utf8_bom_and_crlf_are_accepted(self, tmp_path):
+        level = tmp_path / "level"
+        level.write_bytes(b"\xef\xbb\xbftrue\r\n")
+        config = _config("read", level)
+        assert config.yolo_mode == "true"
+
+    def test_invalid_startup_mode_is_rejected_even_if_file_is_valid(self, tmp_path):
+        level = tmp_path / "level"
+        level.write_text("read")
+        with pytest.raises(ValueError, match="Invalid YOLO mode"):
+            _config("garbage", level)
+
+    def test_access_controller_follows_the_file_without_restart(self, tmp_path):
+        """The mechanism every write tool goes through, not just the property."""
+        from mcp_server_odoo.access_control import AccessController
+
+        level = tmp_path / "level"
+        level.write_text("read")
+        controller = AccessController(_config("read", level))
+
+        allowed, _ = controller.check_operation_allowed("res.partner", "create")
+        assert not allowed
+        level.write_text("true")
+        allowed, _ = controller.check_operation_allowed("res.partner", "create")
+        assert allowed
+        level.write_text("read")
+        allowed, message = controller.check_operation_allowed("res.partner", "unlink")
+        assert not allowed and "read-only" in message
+        allowed, _ = controller.check_operation_allowed("res.partner", "read")
+        assert allowed
+
     def test_unreadable_file_falls_back_to_read(self, tmp_path):
         config = _config("true", tmp_path)  # a directory cannot be read as text
         assert config.yolo_mode == "read"

@@ -67,11 +67,12 @@ class OdooConfig:
             raise ValueError("ODOO_URL must start with http:// or https://")
 
         # Validate YOLO mode
+        # (the startup value, not the one ODOO_YOLO_FILE may override)
         valid_yolo_modes = {"off", "read", "true"}
-        if self.yolo_mode not in valid_yolo_modes:
+        startup_mode = object.__getattribute__(self, "yolo_mode")
+        if startup_mode not in valid_yolo_modes:
             raise ValueError(
-                f"Invalid YOLO mode: {self.yolo_mode}. "
-                f"Must be one of: {', '.join(valid_yolo_modes)}"
+                f"Invalid YOLO mode: {startup_mode}. Must be one of: {', '.join(valid_yolo_modes)}"
             )
 
         # Validate authentication (relaxed for YOLO mode)
@@ -127,6 +128,8 @@ class OdooConfig:
                 self.yolo_mode,
             )
 
+    # Note: dataclasses.replace()/asdict() would freeze the file's current value
+    # as the copy's startup mode; neither is used in this package.
     def __getattribute__(self, name):
         value = object.__getattribute__(self, name)
         if name != "yolo_mode" or value == "off":
@@ -211,17 +214,27 @@ def _read_yolo_mode_file(path: str, startup_mode: str) -> str:
     broken file never grants write access.
     """
     try:
-        raw = Path(path).read_text(encoding="utf-8")
+        raw = Path(path).read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return startup_mode
-    except OSError:
-        logger.warning("ODOO_YOLO_FILE %s unreadable; using read-only", path)
+    except (OSError, ValueError):  # ValueError covers UnicodeDecodeError (e.g. UTF-16)
+        _warn_once(path, "<unreadable>")
         return "read"
     mode = _parse_yolo_mode(raw)
     if mode not in ("read", "true"):
-        logger.warning("ODOO_YOLO_FILE %s has %r; using read-only", path, raw.strip())
+        _warn_once(path, raw.strip()[:20])
         return "read"
     return mode
+
+
+_last_yolo_file_warning: Dict[str, str] = {}
+
+
+def _warn_once(path: str, content: str) -> None:
+    """Log a bad ODOO_YOLO_FILE once per distinct content, not on every access."""
+    if _last_yolo_file_warning.get(path) != content:
+        _last_yolo_file_warning[path] = content
+        logger.warning("ODOO_YOLO_FILE %s has %r; using read-only", path, content)
 
 
 def load_config(env_file: Optional[Path] = None) -> OdooConfig:

@@ -13,7 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ODOO_YOLO` and is re-read on every access, so write access can be opened and
   closed without reconnecting the MCP server. Honored only when the server
   started in YOLO mode; a missing file keeps `ODOO_YOLO`, and an unreadable or
-  invalid file (including `off`) falls back to `read`.
+  invalid file (including `off`, UTF-16) falls back to `read`; UTF-8 with BOM
+  is accepted. `call_model_method` is still registered only at startup, so it
+  is not reachable through the file if the server started in `read`. Keep
+  `ODOO_YOLO=read` as the startup value: a missing file then falls back to
+  read-only.
 
 ### Fixed
 
